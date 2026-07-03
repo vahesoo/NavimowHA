@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+from datetime import timedelta
 from typing import Any
 from urllib.parse import urlparse
 
@@ -11,6 +12,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import config_entry_oauth2_flow
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_track_time_interval
 
 from .auth import NavimowOAuth2Implementation
 from .const import (
@@ -23,10 +25,10 @@ from .const import (
     MQTT_USERNAME,
     MQTT_PASSWORD,
 )
-from .services import async_setup_services
 from .location import location_topic, parse_location_payload
 
 _LOGGER = logging.getLogger(__name__)
+PATCH_VERSION = "v5-zone-restore"
 _LOGGER.debug("Navimow module imported (__init__.py)")
 
 PLATFORMS: list[Platform] = [Platform.LAWN_MOWER, Platform.SENSOR]
@@ -51,6 +53,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    _LOGGER.debug("Navimow custom patch version v5-zone-restore loaded")
     """Set up Navimow from a config entry."""
     # 延迟导入 mower_sdk，避免在加载 config_flow 时触发依赖导入
     from mower_sdk.api import MowerAPI
@@ -156,7 +159,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     ws_path = f"{ws_path}?{parsed.query}"
         auth_headers = {"Authorization": f"Bearer {access_token}"} if ws_path else None
 
-        _LOGGER.info(
+        _LOGGER.debug(
             "MQTT connection parameters: broker=%s port=%s mqtt_url=%s ws_path=%s username=%s password=%s auth_header=%s",
             mqtt_host,
             mqtt_port,
@@ -183,7 +186,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 return str(client_id_bytes) if client_id_bytes else "<empty>"
 
             async def _on_connected() -> None:
-                _LOGGER.info(
+                _LOGGER.debug(
                     "MQTT connected callback: broker=%s port=%s ws_path=%s tls=%s client_id=%s",
                     mqtt.broker,
                     mqtt.port,
@@ -200,7 +203,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             _LOGGER.warning("Failed to subscribe location topic: %s", _err)
 
             async def _on_ready() -> None:
-                _LOGGER.info(
+                _LOGGER.debug(
                     "MQTT ready callback: subscribed to downlink topics on broker=%s port=%s client_id=%s",
                     mqtt.broker,
                     mqtt.port,
@@ -232,13 +235,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             async def _on_message(topic: str, payload: bytes, device_id: str) -> None:
                 payload_text = (payload or b"").decode("utf-8", errors="replace")
-                _LOGGER.debug(
-                    "MQTT message received: topic=%s bytes=%d device=%s payload=%s",
-                    topic,
-                    len(payload or b""),
-                    device_id,
-                    payload_text,
-                )
+
                 if device_id and topic.endswith("/realtimeDate/location"):
                     try:
                         _data = json.loads(payload_text)
@@ -250,6 +247,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         if _coord is not None:
                             hass.loop.call_soon_threadsafe(_coord.ingest_location, _loc)
                     return
+
                 if original_on_message is not None:
                     await original_on_message(topic, payload, device_id)
 
@@ -263,7 +261,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 hass.async_create_task(_on_connected())
 
             def _on_subscribe(_client, _userdata, mid, granted_qos, *args, **kwargs):
-                _LOGGER.info(
+                _LOGGER.debug(
                     "MQTT subscribed: mid=%s granted_qos=%s broker=%s port=%s client_id=%s",
                     mid,
                     granted_qos,
@@ -280,9 +278,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         async def _probe_mqtt_status(sdk: NavimowSDK) -> None:
             await asyncio.sleep(5)
-            _LOGGER.info("MQTT status probe (5s): connected=%s", sdk.is_connected)
+            _LOGGER.debug("MQTT status probe (5s): connected=%s", sdk.is_connected)
             await asyncio.sleep(25)
-            _LOGGER.info("MQTT status probe (30s): connected=%s", sdk.is_connected)
+            _LOGGER.debug("MQTT status probe (30s): connected=%s", sdk.is_connected)
 
         async def _async_refresh_mqtt_credentials(sdk: NavimowSDK, api: MowerAPI) -> None:
             """Token 过期或 MQTT 断连后，重新获取 MQTT 凭据并更新 SDK。
@@ -333,7 +331,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         password=_new_password,
                     )
                 await hass.async_add_executor_job(_do_credential_update)
-                _LOGGER.info(
+                _LOGGER.debug(
                     "MQTT credentials refreshed from server: username=%s",
                     _mask_secret(new_username),
                 )
@@ -353,7 +351,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 reconnect_min_delay=1,
                 reconnect_max_delay=60,
             )
-            _LOGGER.info(
+            _LOGGER.debug(
                 "Invoking SDK MQTT connect: broker=%s port=%s ws_path=%s",
                 mqtt_host,
                 mqtt_port,
@@ -364,7 +362,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         sdk = await hass.async_add_executor_job(_create_sdk, api)
         _attach_mqtt_debug_hooks(sdk, api)
-        async_setup_services(hass, api)
         hass.async_create_task(_probe_mqtt_status(sdk))
 
         coordinators: dict[str, NavimowCoordinator] = {}
@@ -381,6 +378,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             coordinators[device.id] = coordinator
             _location_coordinators[device.id] = coordinator
 
+        async def _async_live_status_timer(_now) -> None:
+            """Refresh battery/state every 120 s independently of MQTT location updates."""
+            for _coord in list(coordinators.values()):
+                hass.async_create_task(_coord.async_force_http_status_refresh())
+
+        unsub_status_timer = async_track_time_interval(
+            hass,
+            _async_live_status_timer,
+            timedelta(seconds=120),
+        )
+
         # 存储数据
         hass.data[DOMAIN][entry.entry_id] = {
             "sdk": sdk,
@@ -389,6 +397,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "coordinators": coordinators,
             "oauth_session": oauth_session,
             "unload_flag": _unload_flag,
+            "unsub_status_timer": unsub_status_timer,
         }
 
         # 转发到平台
@@ -414,6 +423,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # 标记正在卸载，阻止断连回调触发新的凭据刷新
             if "unload_flag" in data:
                 data["unload_flag"][0] = True
+            unsub_status_timer = data.get("unsub_status_timer")
+            if unsub_status_timer:
+                try:
+                    unsub_status_timer()
+                except Exception as err:
+                    _LOGGER.warning("Error cancelling Navimow status timer: %s", err)
+
             sdk = data.get("sdk")
             if sdk:
                 try:
