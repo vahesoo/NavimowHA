@@ -59,6 +59,9 @@ class NavimowMapCard extends HTMLElement {
       battery_entity: null,
       trail_length: 2000,
       history_hours: 24,
+      session_count: 6,
+      show_controls: true,
+      zone_names: {},
       dock_x_entity: null,
       dock_y_entity: null,
       dock_x: null,
@@ -76,6 +79,7 @@ class NavimowMapCard extends HTMLElement {
     if (!this._config.dock_y_entity && /position_y/.test(this._config.y_entity))
       this._config.dock_y_entity = this._config.y_entity.replace('position_y', 'dock_y');
     this._trail = [];
+    this._sessions = [];
     this._lastKey = null;
     this._prevState = null;
     this._histLoaded = false;
@@ -97,6 +101,11 @@ class NavimowMapCard extends HTMLElement {
           <svg class="nm-mwr" preserveAspectRatio="xMidYMid meet"></svg>
         </div>
         <div class="nm-ftr"></div>
+        <div class="nm-controls">
+          <button type="button" class="nm-btn nm-start" data-action="mow">Mow</button>
+          <button type="button" class="nm-btn nm-pause" data-action="pause">Pause</button>
+          <button type="button" class="nm-btn nm-dock" data-action="dock">Dock</button>
+        </div>
       </ha-card>
       <style>
         ha-card { padding: 12px; }
@@ -110,7 +119,17 @@ class NavimowMapCard extends HTMLElement {
         .nm-ftr { margin-top: 8px; font-size: 0.9em; color: var(--secondary-text-color);
           display: flex; gap: 14px; flex-wrap: wrap; }
         .nm-ftr b { color: var(--primary-text-color); }
+        .nm-controls { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
+        .nm-btn { border: none; border-radius: 12px; padding: 11px 8px; font-weight: 700;
+          color: white; cursor: pointer; font-family: inherit; font-size: 13px;
+          transition: transform 0.12s ease, filter 0.12s ease; }
+        .nm-btn:active { transform: scale(0.96); }
+        .nm-btn:hover { filter: brightness(1.08); }
+        .nm-start { background: linear-gradient(145deg,#1b5e20,#2e7d32); }
+        .nm-pause { background: linear-gradient(145deg,#bf360c,#e64a19); }
+        .nm-dock { background: linear-gradient(145deg,#0d47a1,#1565c0); }
       </style>`;
+    this._bindControls();
   }
 
   set hass(hass) {
@@ -185,8 +204,39 @@ class NavimowMapCard extends HTMLElement {
     return out;
   }
 
-  // Rebuild the current session's path from HA's recorder: find the latest
-  // docked -> mowing transition and replay position history since then.
+
+  _zoneName(zone) {
+    const names = this._config.zone_names || {};
+    if (zone === null || zone === undefined || zone === 'unknown' || zone === 'unavailable') return '—';
+    return names[String(zone)] || zone;
+  }
+
+  _startNewSession() {
+    if (this._trail && this._trail.length) {
+      this._sessions.push({ points: this._trail });
+      this._sessions = this._sessions.slice(-Math.max(0, this._config.session_count - 1));
+    }
+    this._trail = [];
+    this._lastKey = null;
+  }
+
+  _bindControls() {
+    if (!this._config || !this._config.show_controls) return;
+    const controls = this.querySelector('.nm-controls');
+    if (!controls || controls._bound) return;
+    controls._bound = true;
+    controls.addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-action]');
+      if (!btn || !this._hass) return;
+      const entity_id = this._config.status_entity;
+      const action = btn.dataset.action;
+      if (action === 'mow') this._hass.callService('lawn_mower', 'start_mowing', { entity_id });
+      if (action === 'pause') this._hass.callService('lawn_mower', 'pause', { entity_id });
+      if (action === 'dock') this._hass.callService('lawn_mower', 'dock', { entity_id });
+    });
+  }
+
+  // Rebuild recent session paths from HA's recorder.
   async _loadSessionHistory() {
     const c = this._config, hass = this._hass;
     try {
@@ -204,12 +254,15 @@ class NavimowMapCard extends HTMLElement {
       const st = (r && r[c.status_entity]) || [];
       const xs = (r && r[c.x_entity]) || [];
       const ys = (r && r[c.y_entity]) || [];
-      let t0 = null; // session start (epoch seconds)
-      for (let i = 1; i < st.length; i++)
-        if (st[i].s === 'mowing' && st[i - 1].s === 'docked') t0 = st[i].lu;
-      if (t0 === null) return; // no session start in window -> live-only
-      // merge x/y series: for each x sample, pair with the latest y at that time
-      const pts = [];
+
+      let starts = [];
+      for (let i = 1; i < st.length; i++) {
+        if (st[i].s === 'mowing' && st[i - 1].s === 'docked') starts.push(st[i].lu);
+      }
+      if (!starts.length) return;
+      starts = starts.slice(-Math.max(1, c.session_count));
+
+      const allPts = [];
       let yi = 0, lastY = null;
       for (const ex of xs) {
         const x = parseFloat(ex.s);
@@ -218,11 +271,21 @@ class NavimowMapCard extends HTMLElement {
           if (!isNaN(v)) lastY = v;
           yi++;
         }
-        if (!isNaN(x) && ex.lu >= t0 && lastY !== null) pts.push([x, lastY]);
+        if (!isNaN(x) && lastY !== null) allPts.push({ t: ex.lu, p: [x, lastY] });
       }
-      if (pts.length) {
-        // history first, then any live points that arrived while fetching
-        this._trail = this._decimate(pts.concat(this._trail), c.trail_length);
+
+      const sessions = [];
+      for (let i = 0; i < starts.length; i++) {
+        const t0 = starts[i];
+        const t1 = starts[i + 1] || Number.POSITIVE_INFINITY;
+        let pts = allPts.filter(o => o.t >= t0 && o.t < t1).map(o => o.p);
+        if (pts.length) sessions.push({ points: this._decimate(pts, c.trail_length), start: t0 });
+      }
+
+      if (sessions.length) {
+        const newest = sessions[sessions.length - 1];
+        this._sessions = sessions.slice(0, -1).slice(-Math.max(0, c.session_count - 1));
+        this._trail = this._decimate(newest.points.concat(this._trail), c.trail_length);
         this._lastKey = null;
         this._update();
       }
@@ -234,10 +297,13 @@ class NavimowMapCard extends HTMLElement {
   _update() {
     if (!this._hass || !this._config) return;
     const c = this._config;
+    const controls = this.querySelector('.nm-controls');
+    if (controls) controls.style.display = c.show_controls ? 'grid' : 'none';
     const x = this._num(c.x_entity);
     const y = this._num(c.y_entity);
     const headingDeg = this._num(c.heading_entity);
-    const zone = this._hass.states[c.zone_entity] ? this._hass.states[c.zone_entity].state : '—';
+    const rawZone = this._hass.states[c.zone_entity] ? this._hass.states[c.zone_entity].state : '—';
+    const zone = this._zoneName(rawZone);
     const stObj = this._hass.states[c.status_entity];
     const status = stObj ? stObj.state : '—';
     // Raw mower status for dock learning. The lawn_mower entity STATE maps
@@ -248,8 +314,7 @@ class NavimowMapCard extends HTMLElement {
 
     // new mowing session (docked -> mowing) -> reset the path
     if (this._prevState === 'docked' && status === 'mowing') {
-      this._trail = [];
-      this._lastKey = null;
+      this._startNewSession();
     }
     this._prevState = status;
 
@@ -336,10 +401,13 @@ class NavimowMapCard extends HTMLElement {
     const M2W = upright ? ((mx, my) => this._mToPx(mx, my)) : ((mx, my) => [mx, my]);
 
     // view extents: trail + dock + live pos (+ image corners when present)
+    const historyPts = (this._sessions || []).flatMap(sess => sess.points || []);
+    const allTrailPts = historyPts.concat(pts);
     const wpts = pts.map(p => M2W(p[0], p[1]));
+    const wallpts = allTrailPts.map(p => M2W(p[0], p[1]));
     const wdock = M2W(dock[0], dock[1]);
-    const xs = wpts.map(p => p[0]).concat([wdock[0]]);
-    const ys = wpts.map(p => p[1]).concat([wdock[1]]);
+    const xs = wallpts.map(p => p[0]).concat([wdock[0]]);
+    const ys = wallpts.map(p => p[1]).concat([wdock[1]]);
     let wpos = null;
     if (x !== null && y !== null) {
       wpos = M2W(x, y);
@@ -381,10 +449,18 @@ class NavimowMapCard extends HTMLElement {
               transform="matrix(${A} ${B} ${C} ${D} ${E} ${F})"
               opacity="${c.overlay_opacity}" preserveAspectRatio="none"/>`;
     }
-    if (wpts.length > 1) {
-      const d = wpts.map((p, i) => `${i === 0 ? 'M' : 'L'}${tx(p[0]).toFixed(1)} ${ty(p[1]).toFixed(1)}`).join(' ');
-      s += `<path d="${d}" fill="none" stroke="var(--primary-color)" stroke-width="4" stroke-opacity="0.55" stroke-linejoin="round" stroke-linecap="round"/>`;
-    }
+    // Draw older sessions first, newest/current last so it stays on top.
+    const allSessions = (this._sessions || []).concat([{ points: pts, current: true }]);
+    const drawSessions = allSessions.filter(sess => sess.points && sess.points.length > 1);
+    drawSessions.forEach((sess, idx) => {
+      const sp = sess.points.map(p => M2W(p[0], p[1]));
+      const d = sp.map((p, i) => `${i === 0 ? 'M' : 'L'}${tx(p[0]).toFixed(1)} ${ty(p[1]).toFixed(1)}`).join(' ');
+      const isCurrent = idx === drawSessions.length - 1;
+      const ageFromNewest = drawSessions.length - 1 - idx;
+      const opacity = isCurrent ? 0.70 : Math.max(0.12, 0.46 - ageFromNewest * 0.07);
+      const stroke = isCurrent ? 'var(--primary-color)' : 'var(--secondary-text-color)';
+      s += `<path d="${d}" fill="none" stroke="${stroke}" stroke-width="5.2" stroke-opacity="${opacity.toFixed(2)}" stroke-linejoin="round" stroke-linecap="round"/>`;
+    });
     // dock marker (configured > auto-learned > origin fallback)
     s += `<g transform="translate(${tx(wdock[0]).toFixed(1)},${ty(wdock[1]).toFixed(1)})">
             <circle r="10" fill="none" stroke="${overlayReady ? 'white' : 'var(--secondary-text-color)'}" stroke-width="3"/>
@@ -398,8 +474,11 @@ class NavimowMapCard extends HTMLElement {
     if (wpos !== null) {
       const px = tx(wpos[0]), py = ty(wpos[1]);
 
-      // Build heading arrow content (relative to marker centre, no offset)
+      // Build mower icon content.
+      // The SVG file should be placed at /config/www/Navimow_top_low.svg.
+      // It is drawn with the mower nose facing up. We rotate it to match heading.
       let mwrInner = '';
+      let iconRot = 0;
       if (headingDeg !== null) {
         const rad = headingDeg * Math.PI / 180;
         let ux = Math.cos(rad), uy = -Math.sin(rad);
@@ -411,9 +490,19 @@ class NavimowMapCard extends HTMLElement {
           const n = Math.hypot(dpr, dpi) || 1;
           ux = dpr / n; uy = -dpi / n;
         }
-        mwrInner += `<line x1="0" y1="0" x2="${(ux * 34).toFixed(1)}" y2="${(uy * 34).toFixed(1)}" stroke="var(--accent-color, #ff9800)" stroke-width="7" stroke-linecap="round"/>`;
+        iconRot = Math.atan2(ux, -uy) * 180 / Math.PI;
       }
-      mwrInner += `<circle r="15" fill="var(--accent-color, #ff9800)" stroke="white" stroke-width="3"/>`;
+      mwrInner += `
+        <g transform="rotate(${iconRot.toFixed(1)})">
+          <image
+            href="/local/Navimow_top_low.svg"
+            x="-22"
+            y="-30"
+            width="44"
+            height="60"
+            preserveAspectRatio="xMidYMid meet"
+          />
+        </g>`;
 
       let grp = mwrSvg.querySelector('.nm-mwr-grp');
       if (!grp) {
