@@ -22,6 +22,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import NavimowCoordinator
+from .location import vehicle_state_name
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -47,7 +48,12 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         name="Zone",
         icon="mdi:map-marker",
         value_fn=lambda c: (
-            loc.get("partition") if (loc := c.get_device_location()) else None
+            (
+                loc.get("mow_boundary")
+                if loc.get("mow_boundary") is not None
+                else loc.get("partition")
+            )
+            if (loc := c.get_device_location()) else None
         ),
     ),
     NavimowSensorEntityDescription(
@@ -80,7 +86,12 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         name="Mowing zone",
         icon="mdi:robot-mower",
         value_fn=lambda c: (
-            loc.get("mow_boundary") if (loc := c.get_device_location()) else None
+            (
+                loc.get("partition")
+                if loc.get("partition") is not None
+                else loc.get("mow_boundary")
+            )
+            if (loc := c.get_device_location()) else None
         ),
     ),
     NavimowSensorEntityDescription(
@@ -109,6 +120,54 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda c: (
             (loc.get("mow_progress") or 0) / 100
+            if (loc := c.get_device_location()) else None
+        ),
+    ),
+    NavimowSensorEntityDescription(
+        key="mowing_percentage",
+        name="Mowing percentage",
+        icon="mdi:percent-outline",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda c: (
+            loc.get("mowing_percentage") if (loc := c.get_device_location()) else None
+        ),
+    ),
+    NavimowSensorEntityDescription(
+        key="subtotal_area",
+        name="Current job area",
+        icon="mdi:texture-box",
+        native_unit_of_measurement="m²",
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda c: (
+            loc.get("subtotal_area") if (loc := c.get_device_location()) else None
+        ),
+    ),
+    NavimowSensorEntityDescription(
+        key="mowing_week_area",
+        name="Weekly mowing area",
+        icon="mdi:calendar-week",
+        native_unit_of_measurement="m²",
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda c: (
+            loc.get("mowing_week_area") if (loc := c.get_device_location()) else None
+        ),
+    ),
+    NavimowSensorEntityDescription(
+        key="active_task",
+        name="Task delay raw",
+        icon="mdi:timer-alert-outline",
+        value_fn=lambda c: (
+            str(loc.get("active_task")).lower()
+            if (loc := c.get_device_location()) and loc.get("active_task") is not None else None
+        ),
+    ),
+    NavimowSensorEntityDescription(
+        key="vehicle_state",
+        name="Vehicle state",
+        icon="mdi:robot-mower",
+        value_fn=lambda c: (
+            vehicle_state_name(loc.get("vehicle_state"))
             if (loc := c.get_device_location()) else None
         ),
     ),
@@ -189,11 +248,28 @@ class NavimowSensor(CoordinatorEntity[NavimowCoordinator], SensorEntity):
             return None
         return {
             "partition_ids": loc.get("partition_ids"),
-            "task_delay": loc.get("task_delay"),
+            "partition": loc.get("partition"),
+            "active_mowing_zone": loc.get("mow_boundary"),
+            "zone_source": "partitionIds" if loc.get("partition") is not None else "currentMowBoundary",
+            "active_task": loc.get("active_task"),
+            "task_delay_raw": loc.get("task_delay"),
             "vehicle_state": loc.get("vehicle_state"),
+            "vehicle_state_name": vehicle_state_name(loc.get("vehicle_state")),
             "pose_time": loc.get("pose_time"),
+            "active_task_time": loc.get("active_task_time"),
+            "delay_time": loc.get("delay_time"),
+            "partition_time": loc.get("partition_time"),
+            "progress_time": loc.get("progress_time"),
+            "mow_boundary_time": loc.get("mow_boundary_time"),
             "mow_boundary": loc.get("mow_boundary"),
             "mow_progress": loc.get("mow_progress"),
+            "mowing_percentage": loc.get("mowing_percentage"),
+            "subtotal_area": loc.get("subtotal_area"),
+            "mowing_week_area": loc.get("mowing_week_area"),
+            "mow_start_type": loc.get("mow_start_type"),
+            "action": loc.get("action"),
+            "sub_action": loc.get("sub_action"),
+            "map_work_position": loc.get("map_work_position"),
         }
 
 
