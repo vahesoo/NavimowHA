@@ -28,6 +28,9 @@ from .location import DOCKED_STATES, update_dock_estimate
 
 _LOGGER = logging.getLogger(__name__)
 
+LIVE_STATUS_REFRESH_INTERVAL_SECONDS = 120
+
+
 
 class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator for Navimow data updates."""
@@ -44,7 +47,7 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=timedelta(seconds=UPDATE_INTERVAL),
+            update_interval=None,
         )
         self.sdk = sdk
         self.api = api
@@ -129,6 +132,32 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.api.set_token(access_token)
         return access_token
 
+    async def async_force_http_status_refresh(self) -> None:
+        """Force-refresh battery/state from HTTP API without touching live MQTT data."""
+        now = time.monotonic()
+        try:
+            await self._async_ensure_valid_token()
+            status = await self.api.async_get_device_status(self.device.id)
+            self._last_state = self._device_status_to_state(status)
+            self._last_http_fetch = now
+            self._last_data_source = "http_status_timer"
+            _LOGGER.debug(
+                "NAVIMOW HTTP STATUS TIMER: device=%s battery=%s state=%s",
+                self.device.id,
+                getattr(self._last_state, "battery", None),
+                getattr(self._last_state, "state", None),
+            )
+            self.async_set_updated_data(self._build_data())
+        except ConfigEntryAuthFailed:
+            raise
+        except Exception as err:
+            # Keep previous battery/state values. Do not make entities unavailable.
+            _LOGGER.debug(
+                "Forced HTTP status refresh failed for device %s; keeping previous state: %s",
+                self.device.id,
+                err,
+            )
+
     async def _async_update_data(self) -> dict[str, Any]:
         # 每次 update 都主动刷新 token，确保 api._token 与 oauth_session 保持同步。
         # 若仅在 HTTP fallback 时刷新，MQTT 正常推数据期间 token 长期不更新，
@@ -152,21 +181,41 @@ class NavimowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_mqtt_update is None
             or now - self._last_mqtt_update > MQTT_STALE_SECONDS
         )
-        can_http_fetch = (
+        due_live_status_refresh = (
+            self._last_http_fetch is None
+            or now - self._last_http_fetch > LIVE_STATUS_REFRESH_INTERVAL_SECONDS
+        )
+        can_http_fallback = (
             self._last_http_fetch is None
             or now - self._last_http_fetch > HTTP_FALLBACK_MIN_INTERVAL
         )
-        if is_mqtt_stale and can_http_fetch:
+
+        # MQTT realtime location/progress does not carry battery often enough.
+        # Refresh general device status regularly so battery/state stay current.
+        # If this request fails, keep the previous state instead of making
+        # entities unavailable.
+        if due_live_status_refresh or (is_mqtt_stale and can_http_fallback):
             try:
                 status = await self.api.async_get_device_status(self.device.id)
                 self._last_state = self._device_status_to_state(status)
                 self._last_http_fetch = now
-                self._last_data_source = "http_fallback"
+                self._last_data_source = (
+                    "http_status_refresh"
+                    if not is_mqtt_stale else "http_fallback"
+                )
+                _LOGGER.debug(
+                    "NAVIMOW HTTP STATUS REFRESH: device=%s battery=%s state=%s",
+                    self.device.id,
+                    getattr(self._last_state, "battery", None),
+                    getattr(self._last_state, "state", None),
+                )
             except ConfigEntryAuthFailed:
                 raise
             except Exception as err:
-                _LOGGER.warning(
-                    "HTTP fallback failed for device %s: %s", self.device.id, err
+                _LOGGER.debug(
+                    "HTTP status refresh failed for device %s; keeping previous state: %s",
+                    self.device.id,
+                    err,
                 )
 
         _LOGGER.debug(
