@@ -18,6 +18,7 @@ from mower_sdk.models import DeviceStateMessage, MowerCommand
 
 from .const import DOMAIN, MOWER_STATUS_TO_ACTIVITY
 from .coordinator import NavimowCoordinator
+from .location import vehicle_state_name
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -126,6 +127,33 @@ class NavimowLawnMower(CoordinatorEntity[NavimowCoordinator], LawnMowerEntity):
             attributes["error"] = state.error
         if state.metrics:
             attributes["metrics"] = state.metrics
+        loc = self.coordinator.get_device_location()
+        if loc:
+            attributes["active_task"] = loc.get("active_task")
+            attributes["task_delay_raw"] = loc.get("task_delay")
+            attributes["vehicle_state"] = loc.get("vehicle_state")
+            attributes["vehicle_state_name"] = vehicle_state_name(loc.get("vehicle_state"))
+            attributes["current_zone"] = loc.get("mow_boundary")
+            attributes["planned_zones"] = loc.get("partition_ids")
+            attributes["zone_source"] = "partitionIds" if loc.get("partition") is not None else "currentMowBoundary"
+            attributes["target_mowing_zone"] = loc.get("partition")
+            attributes["mow_progress_raw"] = loc.get("mow_progress")
+            attributes["mow_progress"] = (
+                (loc.get("mow_progress") or 0) / 100
+                if loc.get("mow_progress") is not None else None
+            )
+            attributes["mowing_percentage"] = loc.get("mowing_percentage")
+            attributes["current_job_area"] = loc.get("subtotal_area")
+            attributes["weekly_mowing_area"] = loc.get("mowing_week_area")
+            attributes["mow_start_type"] = loc.get("mow_start_type")
+            attributes["action"] = loc.get("action")
+            attributes["sub_action"] = loc.get("sub_action")
+            attributes["pose_time"] = loc.get("pose_time")
+            attributes["active_task_time"] = loc.get("active_task_time")
+            attributes["delay_time"] = loc.get("delay_time")
+            attributes["partition_time"] = loc.get("partition_time")
+            attributes["progress_time"] = loc.get("progress_time")
+            attributes["mow_boundary_time"] = loc.get("mow_boundary_time")
         if attrs:
             attributes["attributes"] = attrs.attributes
         return attributes
