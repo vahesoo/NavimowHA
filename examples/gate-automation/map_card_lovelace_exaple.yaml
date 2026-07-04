@@ -3,16 +3,15 @@ title: Navimow map
 x_entity: sensor.tont_position_x
 y_entity: sensor.tont_position_y
 heading_entity: sensor.tont_heading
-zone_entity: sensor.tont_zone
+zone_entity: sensor.tont_mowing_zone
 status_entity: lawn_mower.tont
 battery_entity: sensor.tont_battery
 dock_x_entity: sensor.tont_dock_x
 dock_y_entity: sensor.tont_dock_y
 trail_length: 8000
 history_hours: 48
-session_count: 16
+session_count: 26
 show_controls: true
 zone_names:
-  "3": Left street
-  "5": Right street
   "13": Yard
+  "24": Street
