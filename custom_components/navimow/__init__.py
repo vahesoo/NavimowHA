@@ -31,7 +31,13 @@ _LOGGER = logging.getLogger(__name__)
 PATCH_VERSION = "v5-zone-restore"
 _LOGGER.debug("Navimow module imported (__init__.py)")
 
-PLATFORMS: list[Platform] = [Platform.LAWN_MOWER, Platform.SENSOR]
+PLATFORMS: list[Platform] = [Platform.LAWN_MOWER, Platform.SENSOR, Platform.BINARY_SENSOR]
+
+
+
+async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload Navimow when options change."""
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
@@ -63,6 +69,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     from .coordinator import NavimowCoordinator
     
     hass.data.setdefault(DOMAIN, {})
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     def _mask_secret(value: str | None) -> str:
         if not value:

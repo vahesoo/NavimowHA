@@ -27,9 +27,10 @@
   "options": {
     "step": {
       "init": {
-        "title": "Navimow 选项",
-        "description": "配置 Navimow 集成选项"
+        "title": "Navimow channels",
+        "description": "Configure one mower channel box. Run Configure again to add or edit another mower/channel."
       }
-    }
+    },
+    "error": {}
   }
 }
