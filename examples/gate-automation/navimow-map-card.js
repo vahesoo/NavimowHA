@@ -62,6 +62,10 @@ class NavimowMapCard extends HTMLElement {
       session_count: 6,
       show_controls: true,
       zone_names: {},
+      enable_zoom: true,
+      channel_entities: [],
+      channel_fill: 'rgba(244, 67, 54, 0.35)',
+      channel_stroke: 'rgba(244, 67, 54, 0.80)',
       dock_x_entity: null,
       dock_y_entity: null,
       dock_x: null,
@@ -86,6 +90,10 @@ class NavimowMapCard extends HTMLElement {
     this._imgMeta = null;       // {w, h} once the overlay image loads
     this._imgLoading = false;
     this._cal = this._solveCalibration(this._config.calibration);
+    this._zoom = { scale: 1, cx: 500, cy: 500 };
+    this._pointers = new Map();
+    this._panStart = null;
+    this._pinchStart = null;
     this._dock = null;          // learned [x, y], meters (localStorage fallback)
     this._dockBuf = [];         // rolling samples while docked
     this._dockKey = 'navimow-map-card-dock:' + this._config.x_entity;
@@ -111,7 +119,8 @@ class NavimowMapCard extends HTMLElement {
         ha-card { padding: 12px; }
         .nm-hdr { font-weight: 600; margin-bottom: 6px; }
         .nm-wrap { position: relative; width: 100%; aspect-ratio: 1 / 1;
-          background: var(--secondary-background-color); border-radius: 8px; overflow: hidden; }
+          background: var(--secondary-background-color); border-radius: 8px; overflow: hidden; touch-action: none; cursor: grab; }
+        .nm-wrap:active { cursor: grabbing; }
         svg.nm-map { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: block; }
         svg.nm-mwr { position: absolute; top: 0; left: 0; width: 100%; height: 100%;
           display: block; pointer-events: none; }
@@ -130,6 +139,7 @@ class NavimowMapCard extends HTMLElement {
         .nm-dock { background: linear-gradient(145deg,#0d47a1,#1565c0); }
       </style>`;
     this._bindControls();
+    this._bindGestures();
   }
 
   set hass(hass) {
@@ -182,6 +192,123 @@ class NavimowMapCard extends HTMLElement {
     const qr = (wr * c.ar + wi * c.ai) / den;
     const qi = (wi * c.ar - wr * c.ai) / den;
     return [qr, -qi]; // flip back to image y-down
+  }
+
+
+  _channelBoxes() {
+    const c = this._config;
+    const entities = Array.isArray(c.channel_entities) ? c.channel_entities : (c.channel_entity ? [c.channel_entity] : []);
+    if (!this._hass || !entities.length) return [];
+    const boxes = [];
+    for (const entity of entities) {
+      const st = this._hass.states[entity];
+      if (!st || !st.attributes) continue;
+      const a = st.attributes;
+      const x1 = parseFloat(a.x_min), x2 = parseFloat(a.x_max);
+      const y1 = parseFloat(a.y_min), y2 = parseFloat(a.y_max);
+      if ([x1, x2, y1, y2].some(v => isNaN(v))) continue;
+      boxes.push({ entity, name: a.channel_name || entity, x_min: Math.min(x1, x2), x_max: Math.max(x1, x2), y_min: Math.min(y1, y2), y_max: Math.max(y1, y2) });
+    }
+    return boxes;
+  }
+
+  _applyViewBox() {
+    const svg = this.querySelector('svg.nm-map');
+    const mwrSvg = this.querySelector('svg.nm-mwr');
+    if (!svg || !mwrSvg) return;
+    const V = 1000;
+    const scale = Math.max(1, Math.min(12, this._zoom?.scale || 1));
+    const size = V / scale, half = size / 2;
+    let cx = this._zoom?.cx ?? 500, cy = this._zoom?.cy ?? 500;
+    cx = Math.max(half, Math.min(V - half, cx));
+    cy = Math.max(half, Math.min(V - half, cy));
+    this._zoom = { scale, cx, cy };
+    const vb = `${(cx - half).toFixed(2)} ${(cy - half).toFixed(2)} ${size.toFixed(2)} ${size.toFixed(2)}`;
+    svg.setAttribute('viewBox', vb);
+    mwrSvg.setAttribute('viewBox', vb);
+  }
+
+  _screenToSvgPoint(clientX, clientY) {
+    const wrap = this.querySelector('.nm-wrap');
+    if (!wrap) return [500, 500];
+    const rect = wrap.getBoundingClientRect();
+    const V = 1000;
+    const scale = Math.max(1, Math.min(12, this._zoom?.scale || 1));
+    const size = V / scale, half = size / 2;
+    const left = (this._zoom?.cx ?? 500) - half;
+    const top = (this._zoom?.cy ?? 500) - half;
+    const rx = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    const ry = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+    return [left + rx * size, top + ry * size];
+  }
+
+  _zoomAt(factor, clientX, clientY) {
+    if (!this._config.enable_zoom) return;
+    const wrap = this.querySelector('.nm-wrap');
+    if (!wrap) return;
+    const rect = wrap.getBoundingClientRect();
+    const V = 1000;
+    const oldScale = Math.max(1, Math.min(12, this._zoom?.scale || 1));
+    const oldSize = V / oldScale;
+    const [sx, sy] = this._screenToSvgPoint(clientX, clientY);
+    const newScale = Math.max(1, Math.min(12, oldScale * factor));
+    const newSize = V / newScale;
+    const rx = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    const ry = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+    this._zoom = { scale: newScale, cx: sx - rx * newSize + newSize / 2, cy: sy - ry * newSize + newSize / 2 };
+    this._applyViewBox();
+  }
+
+  _bindGestures() {
+    if (!this._config || !this._config.enable_zoom) return;
+    const wrap = this.querySelector('.nm-wrap');
+    if (!wrap || wrap._nmZoomBound) return;
+    wrap._nmZoomBound = true;
+    wrap.addEventListener('wheel', e => {
+      e.preventDefault();
+      this._zoomAt(e.deltaY < 0 ? 1.18 : 1 / 1.18, e.clientX, e.clientY);
+    }, { passive: false });
+    wrap.addEventListener('dblclick', e => {
+      e.preventDefault();
+      this._zoom = { scale: 1, cx: 500, cy: 500 };
+      this._applyViewBox();
+    });
+    wrap.addEventListener('pointerdown', e => {
+      wrap.setPointerCapture(e.pointerId);
+      this._pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (this._pointers.size === 1) this._panStart = { x: e.clientX, y: e.clientY, cx: this._zoom.cx, cy: this._zoom.cy, scale: this._zoom.scale };
+      if (this._pointers.size === 2) {
+        const pts = Array.from(this._pointers.values());
+        this._pinchStart = { dist: Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y) || 1, scale: this._zoom.scale, cx: this._zoom.cx, cy: this._zoom.cy };
+      }
+    });
+    wrap.addEventListener('pointermove', e => {
+      if (!this._pointers.has(e.pointerId)) return;
+      this._pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      const rect = wrap.getBoundingClientRect(), V = 1000;
+      if (this._pointers.size === 1 && this._panStart && this._zoom.scale > 1) {
+        const size = V / this._panStart.scale;
+        this._zoom = { scale: this._panStart.scale, cx: this._panStart.cx - (e.clientX - this._panStart.x) / rect.width * size, cy: this._panStart.cy - (e.clientY - this._panStart.y) / rect.height * size };
+        this._applyViewBox();
+      } else if (this._pointers.size === 2 && this._pinchStart) {
+        const pts = Array.from(this._pointers.values());
+        const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y) || 1;
+        const midX = (pts[0].x + pts[1].x) / 2, midY = (pts[0].y + pts[1].y) / 2;
+        this._zoom = { scale: this._pinchStart.scale, cx: this._pinchStart.cx, cy: this._pinchStart.cy };
+        this._zoomAt(dist / this._pinchStart.dist, midX, midY);
+      }
+    });
+    const end = e => {
+      this._pointers.delete(e.pointerId);
+      this._panStart = null; this._pinchStart = null;
+      if (this._pointers.size === 1) {
+        const pt = Array.from(this._pointers.values())[0];
+        this._panStart = { x: pt.x, y: pt.y, cx: this._zoom.cx, cy: this._zoom.cy, scale: this._zoom.scale };
+      }
+    };
+    wrap.addEventListener('pointerup', end);
+    wrap.addEventListener('pointercancel', end);
+    wrap.addEventListener('pointerleave', end);
   }
 
   _num(entity) {
@@ -389,7 +516,7 @@ class NavimowMapCard extends HTMLElement {
     const overlayReady = !!(this._imgMeta && this._cal);
 
     if (!overlayReady && pts.length === 0 && (x === null || y === null)) {
-      svg.setAttribute('viewBox', `0 0 ${V} ${V}`);
+      this._applyViewBox();
       svg.innerHTML = `<text x="${V/2}" y="${V/2}" fill="var(--secondary-text-color)" font-size="34" text-anchor="middle">Waiting for position…</text>`;
       return;
     }
@@ -403,8 +530,11 @@ class NavimowMapCard extends HTMLElement {
     // view extents: trail + dock + live pos (+ image corners when present)
     const historyPts = (this._sessions || []).flatMap(sess => sess.points || []);
     const allTrailPts = historyPts.concat(pts);
+    const channelBoxes = this._channelBoxes();
+    const channelCorners = [];
+    for (const b of channelBoxes) channelCorners.push([b.x_min, b.y_min], [b.x_min, b.y_max], [b.x_max, b.y_min], [b.x_max, b.y_max]);
     const wpts = pts.map(p => M2W(p[0], p[1]));
-    const wallpts = allTrailPts.map(p => M2W(p[0], p[1]));
+    const wallpts = allTrailPts.concat(channelCorners).map(p => M2W(p[0], p[1]));
     const wdock = M2W(dock[0], dock[1]);
     const xs = wallpts.map(p => p[0]).concat([wdock[0]]);
     const ys = wallpts.map(p => p[1]).concat([wdock[1]]);
@@ -430,8 +560,7 @@ class NavimowMapCard extends HTMLElement {
     const tx = wx => (wx - x0) * k;
     // image pixel y already points down; meter y points up and needs the flip
     const ty = upright ? (wy => (wy - y0) * k) : (wy => V - (wy - y0) * k);
-    svg.setAttribute('viewBox', `0 0 ${V} ${V}`);
-    mwrSvg.setAttribute('viewBox', `0 0 ${V} ${V}`);
+    this._applyViewBox();
 
     let s = '';
     if (overlayReady && upright) {
@@ -449,6 +578,20 @@ class NavimowMapCard extends HTMLElement {
               transform="matrix(${A} ${B} ${C} ${D} ${E} ${F})"
               opacity="${c.overlay_opacity}" preserveAspectRatio="none"/>`;
     }
+    // Configured channel boxes from integration binary_sensor attributes.
+    // Drawn below mower trails, above the optional overlay image.
+    for (const box of channelBoxes) {
+      const p1 = M2W(box.x_min, box.y_min);
+      const p2 = M2W(box.x_max, box.y_min);
+      const p3 = M2W(box.x_max, box.y_max);
+      const p4 = M2W(box.x_min, box.y_max);
+      const d = `M${tx(p1[0]).toFixed(1)} ${ty(p1[1]).toFixed(1)} ` +
+                `L${tx(p2[0]).toFixed(1)} ${ty(p2[1]).toFixed(1)} ` +
+                `L${tx(p3[0]).toFixed(1)} ${ty(p3[1]).toFixed(1)} ` +
+                `L${tx(p4[0]).toFixed(1)} ${ty(p4[1]).toFixed(1)} Z`;
+      s += `<path d="${d}" fill="${c.channel_fill}" stroke="${c.channel_stroke}" stroke-width="2.5" stroke-opacity="0.95"/>`;
+    }
+
     // Draw older sessions first, newest/current last so it stays on top.
     const allSessions = (this._sessions || []).concat([{ points: pts, current: true }]);
     const drawSessions = allSessions.filter(sess => sess.points && sess.points.length > 1);
