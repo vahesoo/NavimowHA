@@ -1,3 +1,237 @@
+# Navimow Map Card - YAML Configuration README
+#
+# This file documents all currently supported YAML configuration options for
+# navimow-map-card.js.
+#
+# Copy the example below into your Lovelace dashboard and adjust entity IDs,
+# overlay image, calibration and appearance options as needed.
+#
+# ---------------------------------------------------------------------------
+# Full example with defaults
+# ---------------------------------------------------------------------------
+
+type: custom:navimow-map-card
+
+# ---------------------------------------------------------------------------
+# Basic card settings
+# ---------------------------------------------------------------------------
+
+title: Navimow Map
+
+# Mower live position sensors from the Navimow integration
+x_entity: sensor.peter_griffin_position_x
+y_entity: sensor.peter_griffin_position_y
+heading_entity: sensor.peter_griffin_heading
+
+# Zone/status entities
+zone_entity: sensor.navimow_current_zone
+status_entity: lawn_mower.peter_griffin
+
+# Optional battery sensor
+# If not set, battery is simply not displayed in the footer.
+battery_entity: null
+
+# ---------------------------------------------------------------------------
+# Trail / history settings
+# ---------------------------------------------------------------------------
+
+# Maximum number of points kept in one trail.
+# Older points are thinned, not simply removed, so the full path shape is kept.
+trail_length: 2000
+
+# How many hours Home Assistant Recorder history should be searched when
+# rebuilding trails after dashboard reload.
+history_hours: 24
+
+# Number of mowing sessions to display.
+# The newest/current session is drawn on top.
+session_count: 6
+
+# ---------------------------------------------------------------------------
+# Controls
+# ---------------------------------------------------------------------------
+
+# Shows Mow / Pause / Dock buttons below the map.
+show_controls: true
+
+# ---------------------------------------------------------------------------
+# Zone names
+# ---------------------------------------------------------------------------
+
+# Optional friendly names for zone IDs.
+# If a zone is not listed here, the raw zone number is displayed.
+zone_names: {}
+
+# Example:
+#
+# zone_names:
+#   "13": Yard
+#   "24": Front gate area
+
+# ---------------------------------------------------------------------------
+# Zoom and pan
+# ---------------------------------------------------------------------------
+
+# Enables pinch-to-zoom on mobile, mouse wheel zoom on desktop,
+# drag/pan while zoomed, and double-click reset.
+enable_zoom: true
+
+# ---------------------------------------------------------------------------
+# Channel boxes
+# ---------------------------------------------------------------------------
+
+# Optional list of channel binary sensors created by the integration.
+# The card reads x_min, x_max, y_min, y_max attributes from these sensors
+# and draws the channel rectangle on the map.
+channel_entities: []
+
+# Example:
+#
+# channel_entities:
+#   - binary_sensor.tont_front_gate_channel
+
+# Old/simple channel style is still supported for backwards compatibility.
+channel_fill: rgba(244, 67, 54, 0.35)
+channel_stroke: rgba(244, 67, 54, 0.80)
+
+# ---------------------------------------------------------------------------
+# Dock position
+# ---------------------------------------------------------------------------
+
+# Dock sensors are auto-derived from x_entity/y_entity when possible.
+# Example:
+# sensor.tont_position_x -> sensor.tont_dock_x
+# sensor.tont_position_y -> sensor.tont_dock_y
+dock_x_entity: null
+dock_y_entity: null
+
+# Manual dock override in mower-local meters.
+# If both are set, these override dock sensors and local auto-learning.
+dock_x: null
+dock_y: null
+
+# Rolling samples averaged while docked if no dock sensors or manual override
+# are available.
+dock_samples: 25
+
+# ---------------------------------------------------------------------------
+# Overlay image
+# ---------------------------------------------------------------------------
+
+# Optional map / satellite / site plan image.
+# Put the image under /config/www/, then use /local/...
+overlay_image: null
+
+# Example:
+#
+# overlay_image: /local/navimow/my_map.png
+
+overlay_opacity: 0.9
+
+# If true, the overlay image is drawn upright and the mower trail is rotated
+# into the image coordinate system.
+# If false, the card keeps the mower coordinate frame.
+straighten: true
+
+# ---------------------------------------------------------------------------
+# Calibration
+# ---------------------------------------------------------------------------
+
+# Two-point calibration.
+# m  = mower RTK coordinates in meters [x, y]
+# px = same physical point on the overlay image in pixels [x, y]
+calibration: null
+
+# Example:
+#
+# calibration:
+#   - m: [0.140, -2.250]
+#     px: [428, 536]
+#   - m: [-34.713, 0.568]
+#     px: [162, 505]
+
+# Interactive calibration helper.
+#
+# When true:
+# 1. Drive the mower to a known point.
+# 2. Click the same point on the overlay image.
+# 3. Drive the mower to a second known point.
+# 4. Click the second point on the overlay image.
+# 5. Copy the displayed calibration YAML manually.
+#
+# Set this back to false after calibration.
+calibration_mode: false
+
+# ---------------------------------------------------------------------------
+# Appearance
+# ---------------------------------------------------------------------------
+
+appearance:
+
+  # -------------------------------------------------------------------------
+  # Trail appearance
+  # -------------------------------------------------------------------------
+
+  trails:
+
+    # Current / newest trail
+    active:
+      color: var(--primary-color)
+      opacity: 0.70
+      width: 5.2
+
+    # Older trails
+    previous:
+      color: var(--secondary-text-color)
+      width: 5.2
+      opacity:
+        # Opacity of the newest previous trail
+        first: 0.46
+
+        # Opacity of the oldest previous trail
+        last: 0.12
+
+    # Trail fade mode:
+    #
+    # linear:
+    #   Older trails fade evenly.
+    #
+    # exponential:
+    #   Recent previous trails stay more visible, older trails fade faster.
+    fade_mode: linear
+
+  # -------------------------------------------------------------------------
+  # Channel appearance
+  # -------------------------------------------------------------------------
+
+  channel:
+    fill: rgba(244, 67, 54, 0.35)
+    stroke: rgba(244, 67, 54, 0.80)
+    width: 2.5
+
+  # -------------------------------------------------------------------------
+  # Robot marker
+  # -------------------------------------------------------------------------
+
+  # Robot marker scale.
+  #
+  # The robot icon itself is intentionally not configurable here because the
+  # marker rotates according to mower heading, and not every icon works well
+  # as a directional marker.
+  robot:
+    scale: 1.0
+
+  # -------------------------------------------------------------------------
+  # Dock marker
+  # -------------------------------------------------------------------------
+
+  # The dock ring is always shown.
+  # The icon above the ring can be changed with any MDI icon name.
+  dock:
+    icon: mdi:lightning-bolt-circle
+
+Here is my full configuration for exaple
+
 type: custom:navimow-map-card
 title: Navimow map
 x_entity: sensor.tont_position_x
@@ -10,11 +244,47 @@ dock_x_entity: sensor.tont_dock_x
 dock_y_entity: sensor.tont_dock_y
 channel_entities:
   - binary_sensor.tont_front_gate_channel
+calibration_mode: false #true
+overlay_image: /local/my_map.png
+overlay_opacity: 0.5
+calibration:
+  - m:
+      - 0.158
+      - -2.748
+    px:
+      - 374
+      - 430
+  - m:
+      - -29.64
+      - 2.812
+    px:
+      - 208
+      - 259
 trail_length: 8000
 history_hours: 48
-session_count: 10
+session_count: 26
 show_controls: true
 zone_names:
-  "5": Right street
   "13": Yard
   "24": Street
+appearance:
+  trails:
+    active:
+      color: "#fa4616"
+      opacity: 0.7
+      width: 5.2
+    previous:
+      color: "#8ed1e3"
+      width: 5.2
+      opacity:
+        first: 0.46
+        last: 0.12
+    fade_mode: linear
+  channel:
+    fill: rgba(255,0,0,0.5)
+    stroke: rgba(255,0,0,0.5)
+    width: 2.5
+  robot:
+    scale: 1
+  dock:
+    icon: mdi:lightning-bolt-circle
