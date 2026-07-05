@@ -8,10 +8,13 @@ status_entity: lawn_mower.tont
 battery_entity: sensor.tont_battery
 dock_x_entity: sensor.tont_dock_x
 dock_y_entity: sensor.tont_dock_y
+channel_entities:
+  - binary_sensor.tont_front_gate_channel
 trail_length: 8000
 history_hours: 48
-session_count: 26
+session_count: 10
 show_controls: true
 zone_names:
+  "5": Right street
   "13": Yard
   "24": Street
