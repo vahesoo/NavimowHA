@@ -1,5 +1,5 @@
 /*
- * Navimow Map Card  (v3 — satellite overlay + recorder-backed session trail)
+ * Navimow Map Card  (v6.2 — dock icon, appearance config, zoom, calibration, channels)
  *
  * A self-contained Lovelace custom card. Plots the mower's local (x,y) meter
  * coordinates with a heading arrow and the path of the CURRENT mowing session,
@@ -66,6 +66,38 @@ class NavimowMapCard extends HTMLElement {
       channel_entities: [],
       channel_fill: 'rgba(244, 67, 54, 0.35)',
       channel_stroke: 'rgba(244, 67, 54, 0.80)',
+      calibration_mode: false,
+      trails: {
+        active: {
+          color: 'var(--primary-color)',
+          opacity: 0.70,
+          width: 5.2,
+        },
+        previous: {
+          color: 'var(--secondary-text-color)',
+          width: 5.2,
+          opacity: {
+            first: 0.46,
+            last: 0.12,
+          },
+        },
+        fade_mode: 'linear',
+      },
+      appearance: {
+        trails: null,
+        channel: {
+          fill: 'rgba(244, 67, 54, 0.35)',
+          stroke: 'rgba(244, 67, 54, 0.80)',
+          width: 2.5,
+        },
+        robot: {
+          scale: 1.0,
+        },
+        dock: {
+          scale: 1.0,
+          icon: 'mdi:lightning-bolt-circle',
+        },
+      },
       dock_x_entity: null,
       dock_y_entity: null,
       dock_x: null,
@@ -94,6 +126,8 @@ class NavimowMapCard extends HTMLElement {
     this._pointers = new Map();
     this._panStart = null;
     this._pinchStart = null;
+    this._calibrationClicks = [];
+    this._lastDraw = null;
     this._dock = null;          // learned [x, y], meters (localStorage fallback)
     this._dockBuf = [];         // rolling samples while docked
     this._dockKey = 'navimow-map-card-dock:' + this._config.x_entity;
@@ -109,6 +143,7 @@ class NavimowMapCard extends HTMLElement {
           <svg class="nm-mwr" preserveAspectRatio="xMidYMid meet"></svg>
         </div>
         <div class="nm-ftr"></div>
+        <div class="nm-cal"></div>
         <div class="nm-controls">
           <button type="button" class="nm-btn nm-start" data-action="mow">Mow</button>
           <button type="button" class="nm-btn nm-pause" data-action="pause">Pause</button>
@@ -128,6 +163,11 @@ class NavimowMapCard extends HTMLElement {
         .nm-ftr { margin-top: 8px; font-size: 0.9em; color: var(--secondary-text-color);
           display: flex; gap: 14px; flex-wrap: wrap; }
         .nm-ftr b { color: var(--primary-text-color); }
+        .nm-cal { display: none; margin-top: 8px; padding: 8px; border-radius: 8px;
+          background: var(--secondary-background-color); font-size: 0.85em; }
+        .nm-cal pre { white-space: pre-wrap; margin: 6px 0 0; font-family: monospace; }
+        .nm-cal button { margin-top: 6px; border: none; border-radius: 8px; padding: 7px 10px;
+          font-weight: 700; cursor: pointer; background: var(--primary-color); color: var(--text-primary-color); }
         .nm-controls { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
         .nm-btn { border: none; border-radius: 12px; padding: 11px 8px; font-weight: 700;
           color: white; cursor: pointer; font-family: inherit; font-size: 13px;
@@ -194,6 +234,71 @@ class NavimowMapCard extends HTMLElement {
     return [qr, -qi]; // flip back to image y-down
   }
 
+
+
+  _updateCalibrationUi() {
+    const el = this.querySelector('.nm-cal');
+    if (!el) return;
+    if (!this._config.calibration_mode) {
+      el.style.display = 'none';
+      el.innerHTML = '';
+      return;
+    }
+
+    el.style.display = 'block';
+    const clicks = this._calibrationClicks || [];
+    const yaml = clicks.length === 2
+      ? `calibration:\n  - m: [${clicks[0].m[0].toFixed(3)}, ${clicks[0].m[1].toFixed(3)}]\n    px: [${Math.round(clicks[0].px[0])}, ${Math.round(clicks[0].px[1])}]\n  - m: [${clicks[1].m[0].toFixed(3)}, ${clicks[1].m[1].toFixed(3)}]\n    px: [${Math.round(clicks[1].px[0])}, ${Math.round(clicks[1].px[1])}]`
+      : '';
+
+    el.innerHTML = `
+      <b>Calibration mode</b><br>
+      Click two known points on the map image. At each click, the card stores the clicked image pixel and the mower's current RTK X/Y position.<br>
+      Points selected: <b>${clicks.length}/2</b>
+      ${clicks.map((p, i) => `<br>Point ${i + 1}: m=[${p.m[0].toFixed(3)}, ${p.m[1].toFixed(3)}], px=[${Math.round(p.px[0])}, ${Math.round(p.px[1])}]`).join('')}
+      ${yaml ? `<pre>${yaml}</pre><button type="button" class="nm-reset-cal">Reset points</button>` : `<br><button type="button" class="nm-reset-cal">Reset points</button>`}
+    `;
+    const reset = el.querySelector('.nm-reset-cal');
+    if (reset) {
+      reset.onclick = () => {
+        this._calibrationClicks = [];
+        this._updateCalibrationUi();
+        this._update();
+      };
+    }
+  }
+
+  _screenToWorld(clientX, clientY) {
+    const [sx, sy] = this._screenToSvgPoint(clientX, clientY);
+    const d = this._lastDraw;
+    if (!d) return null;
+    const wx = d.x0 + sx / d.k;
+    const wy = d.upright ? (d.y0 + sy / d.k) : (d.y0 + (d.V - sy) / d.k);
+    return [wx, wy];
+  }
+
+  _handleCalibrationClick(e) {
+    if (!this._config.calibration_mode || !this._lastDraw || !this._lastDraw.overlayReady) return false;
+    const x = this._num(this._config.x_entity);
+    const y = this._num(this._config.y_entity);
+    if (x === null || y === null) return false;
+
+    const world = this._screenToWorld(e.clientX, e.clientY);
+    if (!world) return false;
+
+    let px = world;
+    if (!this._lastDraw.upright) {
+      // In mower-frame view, click world coordinates are mower meters; convert to image pixels.
+      if (!this._cal) return false;
+      px = this._mToPx(world[0], world[1]);
+    }
+
+    this._calibrationClicks.push({ m: [x, y], px });
+    this._calibrationClicks = this._calibrationClicks.slice(-2);
+    this._updateCalibrationUi();
+    this._update();
+    return true;
+  }
 
   _channelBoxes() {
     const c = this._config;
@@ -274,6 +379,10 @@ class NavimowMapCard extends HTMLElement {
       this._applyViewBox();
     });
     wrap.addEventListener('pointerdown', e => {
+      if (this._config.calibration_mode && this._handleCalibrationClick(e)) {
+        e.preventDefault();
+        return;
+      }
       wrap.setPointerCapture(e.pointerId);
       this._pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (this._pointers.size === 1) this._panStart = { x: e.clientX, y: e.clientY, cx: this._zoom.cx, cy: this._zoom.cy, scale: this._zoom.scale };
@@ -331,6 +440,65 @@ class NavimowMapCard extends HTMLElement {
     return out;
   }
 
+
+
+
+  _appearanceConfig() {
+    const a = this._config.appearance || {};
+    const channel = a.channel || {};
+    const robot = a.robot || {};
+    const dock = a.dock || {};
+    return {
+      channel: {
+        fill: channel.fill || this._config.channel_fill || 'rgba(244, 67, 54, 0.35)',
+        stroke: channel.stroke || this._config.channel_stroke || 'rgba(244, 67, 54, 0.80)',
+        width: Number.isFinite(Number(channel.width)) ? Number(channel.width) : 2.5,
+      },
+      robot: {
+        scale: Number.isFinite(Number(robot.scale)) ? Number(robot.scale) : 1.0,
+      },
+      dock: {
+        scale: Number.isFinite(Number(dock.scale)) ? Number(dock.scale) : 1.0,
+        icon: dock.icon || 'mdi:lightning-bolt-circle',
+      },
+      trails: a.trails || this._config.trails || {},
+    };
+  }
+
+  _trailConfig() {
+    const t = this._appearanceConfig().trails || {};
+    const active = t.active || {};
+    const previous = t.previous || {};
+    const prevOpacity = previous.opacity || {};
+    return {
+      active: {
+        color: active.color || 'var(--primary-color)',
+        opacity: Number.isFinite(Number(active.opacity)) ? Number(active.opacity) : 0.70,
+        width: Number.isFinite(Number(active.width)) ? Number(active.width) : 5.2,
+      },
+      previous: {
+        color: previous.color || 'var(--secondary-text-color)',
+        width: Number.isFinite(Number(previous.width)) ? Number(previous.width) : 5.2,
+        opacityFirst: Number.isFinite(Number(prevOpacity.first)) ? Number(prevOpacity.first) : 0.46,
+        opacityLast: Number.isFinite(Number(prevOpacity.last)) ? Number(prevOpacity.last) : 0.12,
+      },
+      fadeMode: (t.fade_mode || 'linear').toString().toLowerCase(),
+    };
+  }
+
+  _historyTrailOpacity(ageFromNewest, historyCount, cfg) {
+    if (historyCount <= 1) return cfg.previous.opacityFirst;
+    const first = cfg.previous.opacityFirst;
+    const last = cfg.previous.opacityLast;
+    const t = Math.max(0, Math.min(1, (historyCount - 1 - ageFromNewest) / (historyCount - 1)));
+
+    if (cfg.fadeMode === 'exponential') {
+      const curved = Math.pow(t, 2.2);
+      return last + (first - last) * curved;
+    }
+
+    return last + (first - last) * t;
+  }
 
   _zoneName(zone) {
     const names = this._config.zone_names || {};
@@ -426,6 +594,7 @@ class NavimowMapCard extends HTMLElement {
     const c = this._config;
     const controls = this.querySelector('.nm-controls');
     if (controls) controls.style.display = c.show_controls ? 'grid' : 'none';
+    this._updateCalibrationUi();
     const x = this._num(c.x_entity);
     const y = this._num(c.y_entity);
     const headingDeg = this._num(c.heading_entity);
@@ -560,6 +729,7 @@ class NavimowMapCard extends HTMLElement {
     const tx = wx => (wx - x0) * k;
     // image pixel y already points down; meter y points up and needs the flip
     const ty = upright ? (wy => (wy - y0) * k) : (wy => V - (wy - y0) * k);
+    this._lastDraw = { x0, y0, k, V, upright, overlayReady };
     this._applyViewBox();
 
     let s = '';
@@ -580,6 +750,7 @@ class NavimowMapCard extends HTMLElement {
     }
     // Configured channel boxes from integration binary_sensor attributes.
     // Drawn below mower trails, above the optional overlay image.
+    const appearance = this._appearanceConfig();
     for (const box of channelBoxes) {
       const p1 = M2W(box.x_min, box.y_min);
       const p2 = M2W(box.x_max, box.y_min);
@@ -589,25 +760,52 @@ class NavimowMapCard extends HTMLElement {
                 `L${tx(p2[0]).toFixed(1)} ${ty(p2[1]).toFixed(1)} ` +
                 `L${tx(p3[0]).toFixed(1)} ${ty(p3[1]).toFixed(1)} ` +
                 `L${tx(p4[0]).toFixed(1)} ${ty(p4[1]).toFixed(1)} Z`;
-      s += `<path d="${d}" fill="${c.channel_fill}" stroke="${c.channel_stroke}" stroke-width="2.5" stroke-opacity="0.95"/>`;
+      s += `<path d="${d}" fill="${appearance.channel.fill}" stroke="${appearance.channel.stroke}" stroke-width="${appearance.channel.width}" stroke-opacity="0.95"/>`;
+    }
+
+    // Calibration click markers.
+    if (c.calibration_mode && this._calibrationClicks && this._calibrationClicks.length) {
+      this._calibrationClicks.forEach((pt, i) => {
+        let wp;
+        if (upright) {
+          wp = pt.px;
+        } else {
+          wp = this._pxToM(pt.px[0], pt.px[1]);
+        }
+        s += `<g transform="translate(${tx(wp[0]).toFixed(1)},${ty(wp[1]).toFixed(1)})">
+                <circle r="12" fill="rgba(255,0,0,0.85)" stroke="white" stroke-width="3"/>
+                <text x="18" y="8" font-size="28" fill="white" style="paint-order:stroke" stroke="rgba(0,0,0,0.8)" stroke-width="5">${i + 1}</text>
+              </g>`;
+      });
     }
 
     // Draw older sessions first, newest/current last so it stays on top.
+    const trailCfg = this._trailConfig();
     const allSessions = (this._sessions || []).concat([{ points: pts, current: true }]);
     const drawSessions = allSessions.filter(sess => sess.points && sess.points.length > 1);
+    const historyCount = Math.max(0, drawSessions.length - 1);
     drawSessions.forEach((sess, idx) => {
       const sp = sess.points.map(p => M2W(p[0], p[1]));
       const d = sp.map((p, i) => `${i === 0 ? 'M' : 'L'}${tx(p[0]).toFixed(1)} ${ty(p[1]).toFixed(1)}`).join(' ');
       const isCurrent = idx === drawSessions.length - 1;
       const ageFromNewest = drawSessions.length - 1 - idx;
-      const opacity = isCurrent ? 0.70 : Math.max(0.12, 0.46 - ageFromNewest * 0.07);
-      const stroke = isCurrent ? 'var(--primary-color)' : 'var(--secondary-text-color)';
-      s += `<path d="${d}" fill="none" stroke="${stroke}" stroke-width="5.2" stroke-opacity="${opacity.toFixed(2)}" stroke-linejoin="round" stroke-linecap="round"/>`;
+      const opacity = isCurrent
+        ? trailCfg.active.opacity
+        : this._historyTrailOpacity(ageFromNewest, historyCount, trailCfg);
+      const stroke = isCurrent ? trailCfg.active.color : trailCfg.previous.color;
+      const width = isCurrent ? trailCfg.active.width : trailCfg.previous.width;
+      s += `<path d="${d}" fill="none" stroke="${stroke}" stroke-width="${width}" stroke-opacity="${Math.max(0, Math.min(1, opacity)).toFixed(2)}" stroke-linejoin="round" stroke-linecap="round"/>`;
     });
     // dock marker (configured > auto-learned > origin fallback)
+    const dockScale = Math.max(0.2, appearance.dock.scale || 1);
+    const dockIconSize = 28 * dockScale;
+    const dockIconColor = overlayReady ? 'white' : 'var(--secondary-text-color)';
     s += `<g transform="translate(${tx(wdock[0]).toFixed(1)},${ty(wdock[1]).toFixed(1)})">
-            <circle r="10" fill="none" stroke="${overlayReady ? 'white' : 'var(--secondary-text-color)'}" stroke-width="3"/>
-            <text y="-16" font-size="26" text-anchor="middle" fill="${overlayReady ? 'white' : 'var(--secondary-text-color)'}"${overlayReady ? ' style="paint-order:stroke" stroke="rgba(0,0,0,0.6)" stroke-width="4"' : ''}>dock</text>
+            <circle r="${(10 * dockScale).toFixed(1)}" fill="none" stroke="${dockIconColor}" stroke-width="3"/>
+            <foreignObject x="${(-dockIconSize / 2).toFixed(1)}" y="${(-44 * dockScale).toFixed(1)}"
+              width="${dockIconSize.toFixed(1)}" height="${dockIconSize.toFixed(1)}">
+              <ha-icon icon="${appearance.dock.icon}" style="width:${dockIconSize.toFixed(1)}px;height:${dockIconSize.toFixed(1)}px;color:${dockIconColor};filter:${overlayReady ? 'drop-shadow(0 0 3px rgba(0,0,0,0.85))' : 'none'};"></ha-icon>
+            </foreignObject>
           </g>`;
     svg.innerHTML = s;
 
@@ -635,14 +833,17 @@ class NavimowMapCard extends HTMLElement {
         }
         iconRot = Math.atan2(ux, -uy) * 180 / Math.PI;
       }
+      const robotScale = Math.max(0.2, appearance.robot.scale || 1);
+      const robotW = 44 * robotScale;
+      const robotH = 60 * robotScale;
       mwrInner += `
         <g transform="rotate(${iconRot.toFixed(1)})">
           <image
             href="/local/Navimow_top_low.svg"
-            x="-22"
-            y="-30"
-            width="44"
-            height="60"
+            x="${(-robotW / 2).toFixed(1)}"
+            y="${(-robotH / 2).toFixed(1)}"
+            width="${robotW.toFixed(1)}"
+            height="${robotH.toFixed(1)}"
             preserveAspectRatio="xMidYMid meet"
           />
         </g>`;
@@ -676,5 +877,5 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: 'navimow-map-card',
   name: 'Navimow Map',
-  description: 'Live Navimow position + session path, optional satellite overlay.',
+  description: 'Live Navimow position + session path, zoom, channels, and optional satellite overlay.',
 });
