@@ -32,6 +32,106 @@ class NavimowSensorEntityDescription(SensorEntityDescription):
     value_fn: Callable[[NavimowCoordinator], Any]
 
 
+VEHICLE_STATE_NAMES: dict[int, str] = {
+    0: "unknown",
+    1: "idle",
+    2: "docked",
+    3: "docked",
+    4: "mowing",
+    5: "docking",
+    6: "mapping",
+}
+
+
+def _vehicle_state_name(value: Any) -> str | None:
+    """Return a readable vehicle state name.
+
+    Keeps the local fallback table here so new states can be displayed even if
+    the parser/helper in location.py has not yet been updated.
+    """
+    if value is None:
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return vehicle_state_name(value)
+    return VEHICLE_STATE_NAMES.get(number, vehicle_state_name(number) or f"state_{number}")
+
+
+def _state_attr(coordinator: NavimowCoordinator, *names: str) -> Any:
+    """Read a value from the current device state using several possible names."""
+    state = coordinator.get_device_state()
+    if state is None:
+        return None
+
+    for name in names:
+        if isinstance(state, dict) and name in state:
+            return state.get(name)
+        if hasattr(state, name):
+            return getattr(state, name)
+
+    error = None
+    if isinstance(state, dict):
+        error = state.get("error")
+    elif hasattr(state, "error"):
+        error = getattr(state, "error")
+
+    if error is not None:
+        for name in names:
+            if isinstance(error, dict) and name in error:
+                return error.get(name)
+            if hasattr(error, name):
+                return getattr(error, name)
+
+    return None
+
+
+def _error_code(coordinator: NavimowCoordinator) -> Any:
+    """Return the current API/device error code if available."""
+    return _state_attr(
+        coordinator,
+        "error_code",
+        "errorCode",
+        "code",
+        "err_code",
+        "errCode",
+    )
+
+
+def _error_message(coordinator: NavimowCoordinator) -> Any:
+    """Return the current API/device error message if available."""
+    message = _state_attr(
+        coordinator,
+        "error_message",
+        "errorMessage",
+        "message",
+        "msg",
+        "description",
+    )
+    if message:
+        return message
+    code = _error_code(coordinator)
+    return str(code) if code else None
+
+
+
+# These MQTT/location based values may be unknown immediately after a Home Assistant
+# restart until the mower publishes the next matching MQTT packet. Restoring the last
+# value prevents map cards, dashboards and automations from showing "unknown" during
+# that startup window. Error sensors are intentionally not restored so stale errors
+# are not shown after a restart.
+RESTORED_SENSOR_KEYS: set[str] = {
+    "zone",
+    "mowing_zone",
+    "mow_progress",
+    "mowing_percentage",
+    "subtotal_area",
+    "mowing_week_area",
+    "active_task",
+    "vehicle_state",
+}
+
+
 SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
     NavimowSensorEntityDescription(
         key="battery",
@@ -167,9 +267,21 @@ SENSOR_DESCRIPTIONS: tuple[NavimowSensorEntityDescription, ...] = (
         name="Vehicle state",
         icon="mdi:robot-mower",
         value_fn=lambda c: (
-            vehicle_state_name(loc.get("vehicle_state"))
+            _vehicle_state_name(loc.get("vehicle_state"))
             if (loc := c.get_device_location()) else None
         ),
+    ),
+    NavimowSensorEntityDescription(
+        key="error_code",
+        name="Error code",
+        icon="mdi:alert-circle-outline",
+        value_fn=lambda c: _error_code(c),
+    ),
+    NavimowSensorEntityDescription(
+        key="error_message",
+        name="Error message",
+        icon="mdi:alert-outline",
+        value_fn=lambda c: _error_message(c),
     ),
 )
 
@@ -188,11 +300,12 @@ async def async_setup_entry(
     for device in devices:
         coordinator = coordinators[device.id]
         for description in SENSOR_DESCRIPTIONS:
-            cls = (
-                NavimowDockSensor
-                if description.key in ("dock_x", "dock_y")
-                else NavimowSensor
-            )
+            if description.key in ("dock_x", "dock_y"):
+                cls = NavimowDockSensor
+            elif description.key in RESTORED_SENSOR_KEYS:
+                cls = NavimowRestoredSensor
+            else:
+                cls = NavimowSensor
             entities.append(
                 cls(
                     coordinator=coordinator,
@@ -254,7 +367,7 @@ class NavimowSensor(CoordinatorEntity[NavimowCoordinator], SensorEntity):
             "active_task": loc.get("active_task"),
             "task_delay_raw": loc.get("task_delay"),
             "vehicle_state": loc.get("vehicle_state"),
-            "vehicle_state_name": vehicle_state_name(loc.get("vehicle_state")),
+            "vehicle_state_name": _vehicle_state_name(loc.get("vehicle_state")),
             "pose_time": loc.get("pose_time"),
             "active_task_time": loc.get("active_task_time"),
             "delay_time": loc.get("delay_time"),
@@ -270,7 +383,46 @@ class NavimowSensor(CoordinatorEntity[NavimowCoordinator], SensorEntity):
             "action": loc.get("action"),
             "sub_action": loc.get("sub_action"),
             "map_work_position": loc.get("map_work_position"),
+            "error_code": _error_code(self.coordinator),
+            "error_message": _error_message(self.coordinator),
         }
+
+
+
+class NavimowRestoredSensor(NavimowSensor, RestoreSensor):
+    """Sensor that restores the last known value after Home Assistant restarts.
+
+    The mower does not publish every field immediately after HA starts. For
+    location/task/progress values this class shows the last known HA-stored value
+    until a fresh live MQTT/API value arrives.
+    """
+
+    _restored_value: Any = None
+    _has_restored_value: bool = False
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if (data := await self.async_get_last_sensor_data()) is not None:
+            self._restored_value = data.native_value
+            self._has_restored_value = data.native_value is not None
+
+    @property
+    def native_value(self) -> Any:
+        live = self.entity_description.value_fn(self.coordinator)
+        if live is not None:
+            return live
+        return self._restored_value if self._has_restored_value else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        attrs = super().extra_state_attributes
+        if attrs is not None:
+            attrs = dict(attrs)
+            attrs["source"] = "live"
+            return attrs
+        if self._has_restored_value:
+            return {"source": "restored"}
+        return None
 
 
 class NavimowDockSensor(NavimowSensor, RestoreSensor):
