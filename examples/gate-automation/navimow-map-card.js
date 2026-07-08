@@ -1,14 +1,17 @@
 /*
- * Navimow Map Card  (v6.2 — dock icon, appearance config, zoom, calibration, channels)
+ * Navimow Map Card  (v6.3 — robust reload path rebuild, dock icon, appearance config, zoom, calibration, channels)
  *
  * A self-contained Lovelace custom card. Plots the mower's local (x,y) meter
  * coordinates with a heading arrow and the path of the CURRENT mowing session,
  * optionally over a calibrated aerial/satellite image. The session path is
  * rebuilt from Home Assistant's recorder history on load, so it survives page
  * reloads and navigation, and resets automatically when a new session starts
- * (docked -> mowing). Auto-learns the dock position via the integration's dock
- * sensors (fork v1.1.0+position.4) with a local-learning fallback for older
- * forks. No external dependencies.
+ * (docked -> mowing). The rebuild also recovers the path when the recorder has
+ * no docked->mowing transition in the window (e.g. the session started earlier
+ * than history_hours) by treating the available position points as one session.
+ * Auto-learns the dock position via the integration's dock sensors
+ * (fork v1.1.0+position.4) with a local-learning fallback for older forks.
+ * No external dependencies.
  *
  * Install:
  *   1. Put this file at /config/www/navimow-map-card.js
@@ -550,13 +553,8 @@ class NavimowMapCard extends HTMLElement {
       const xs = (r && r[c.x_entity]) || [];
       const ys = (r && r[c.y_entity]) || [];
 
-      let starts = [];
-      for (let i = 1; i < st.length; i++) {
-        if (st[i].s === 'mowing' && st[i - 1].s === 'docked') starts.push(st[i].lu);
-      }
-      if (!starts.length) return;
-      starts = starts.slice(-Math.max(1, c.session_count));
-
+      // Build the position point stream first so the session-start logic can
+      // fall back to it when the recorder has no docked->mowing transition.
       const allPts = [];
       let yi = 0, lastY = null;
       for (const ex of xs) {
@@ -568,6 +566,23 @@ class NavimowMapCard extends HTMLElement {
         }
         if (!isNaN(x) && lastY !== null) allPts.push({ t: ex.lu, p: [x, lastY] });
       }
+
+      let starts = [];
+      for (let i = 1; i < st.length; i++) {
+        if (st[i].s === 'mowing' && st[i - 1].s === 'docked') starts.push(st[i].lu);
+      }
+      // Session already running when the window began (its docked->mowing edge
+      // predates history_hours): use the window start so its earlier points
+      // aren't dropped.
+      if (st.length && st[0].s === 'mowing' && allPts.length) starts.unshift(allPts[0].t);
+      // No transition captured at all (status entity not recorded, or the
+      // session spans the whole window): treat every available point as one
+      // current session instead of discarding the entire path.
+      if (!starts.length) {
+        if (allPts.length) starts = [allPts[0].t];
+        else return; // truly no position history -> live-only
+      }
+      starts = starts.slice(-Math.max(1, c.session_count));
 
       const sessions = [];
       for (let i = 0; i < starts.length; i++) {
