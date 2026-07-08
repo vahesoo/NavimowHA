@@ -602,6 +602,18 @@ class NavimowMapCard extends HTMLElement {
     const zone = this._zoneName(rawZone);
     const stObj = this._hass.states[c.status_entity];
     const status = stObj ? stObj.state : '—';
+
+    let translatedStatus = status;
+
+    if (stObj && this._hass.localize) {
+      const domain = c.status_entity.split('.')[0];
+
+      // Try the primary core domain path, then the entity_component fallback, then default to original status
+      translatedStatus = this._hass.localize(`component.${domain}.state._.${status}`) ||
+          this._hass.localize(`component.${domain}.entity_component._.state.${status}`) ||
+          status;
+    }
+
     // Raw mower status for dock learning. The lawn_mower entity STATE maps
     // 'idle' to 'docked' (activity), so a mower stopped mid-lawn would look
     // docked and poison the dock estimate — prefer the raw 'status' attribute.
@@ -650,7 +662,7 @@ class NavimowMapCard extends HTMLElement {
     this.querySelector('.nm-hdr').textContent = c.title;
     const parts = [
       `Zone: <b>${zone}</b>`,
-      `Status: <b>${status}</b>`,
+      `Status: <b>${translatedStatus}</b>`,
       (x !== null && y !== null) ? `Pos: <b>${x.toFixed(1)}, ${y.toFixed(1)} m</b>` : `Pos: <b>—</b>`,
     ];
     if (batt !== null) parts.push(`Battery: <b>${batt}%</b>`);
