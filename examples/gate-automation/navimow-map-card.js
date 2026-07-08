@@ -1,5 +1,5 @@
 /*
- * Navimow Map Card  (v6.2 — dock icon, appearance config, zoom, calibration, channels)
+ * Navimow Map Card  (v8.4 — overlay rotation, session filtering, calibration apply, editor improvements)
  *
  * A self-contained Lovelace custom card. Plots the mower's local (x,y) meter
  * coordinates with a heading arrow and the path of the CURRENT mowing session,
@@ -28,11 +28,27 @@
  *   trail_length: 2000        # max trail points kept (older points are thinned,
  *                             #   not dropped, so the whole path keeps its shape)
  *   history_hours: 24         # how far back to look for the session start
+ *   session_count: 6          # max sessions for count/today_or_count modes
+ *   session_gap_minutes: 20   # fallback split when no clean mower state intervals exist
+ *   session_interrupt_grace_minutes: 5
+ *                            # ignore short unavailable/unknown state blips inside one session
+ *   session_filter:
+ *     mode: count             # count | today | today_or_count
+ *     reset_time: "03:00"     # local time when the mowing day starts
+ *   trail_legend: false       # show visible session start times below the map
+ *   history_view:
+ *     enabled: false           # show Today / Yesterday / N days ago selector
+ *     days_back: 4             # how many previous mowing days can be selected
+ *     show_live_marker_when_history: false
  *   dock_x_entity:            # integration dock sensors (auto-derived from
  *   dock_y_entity:            #   x_entity/y_entity names if not set)
  *   dock_x:                   # manual dock override (meters); disables auto-learn
  *   dock_y:                   #   (both must be set)
  *   dock_samples: 25          # rolling samples averaged while docked (fallback)
+ *
+ * Overlay alignment:
+ *   straighten: true          # true = keep aerial photo upright, rotate mower trail to it
+ *                             # false = keep mower coordinate frame stable, rotate/transform aerial image
  *
  * Satellite / aerial overlay (optional):
  *   overlay_image: /local/yard.png    # your property image under /config/www
@@ -60,6 +76,18 @@ class NavimowMapCard extends HTMLElement {
       trail_length: 2000,
       history_hours: 24,
       session_count: 6,
+      session_gap_minutes: 20,
+      session_interrupt_grace_minutes: 5,
+      session_filter: {
+        mode: 'count',
+        reset_time: '03:00',
+      },
+      trail_legend: false,
+      history_view: {
+        enabled: false,
+        days_back: 4,
+        show_live_marker_when_history: false,
+      },
       show_controls: true,
       zone_names: {},
       enable_zoom: true,
@@ -116,6 +144,9 @@ class NavimowMapCard extends HTMLElement {
       this._config.dock_y_entity = this._config.y_entity.replace('position_y', 'dock_y');
     this._trail = [];
     this._sessions = [];
+    this._currentSessionStart = null;
+    this._lastSessionFilterStart = null;
+    this._historyDayOffset = 0;
     this._lastKey = null;
     this._prevState = null;
     this._histLoaded = false;
@@ -143,6 +174,8 @@ class NavimowMapCard extends HTMLElement {
           <svg class="nm-mwr" preserveAspectRatio="xMidYMid meet"></svg>
         </div>
         <div class="nm-ftr"></div>
+        <div class="nm-history"></div>
+        <div class="nm-legend"></div>
         <div class="nm-cal"></div>
         <div class="nm-controls">
           <button type="button" class="nm-btn nm-start" data-action="mow">Mow</button>
@@ -163,10 +196,16 @@ class NavimowMapCard extends HTMLElement {
         .nm-ftr { margin-top: 8px; font-size: 0.9em; color: var(--secondary-text-color);
           display: flex; gap: 14px; flex-wrap: wrap; }
         .nm-ftr b { color: var(--primary-text-color); }
+        .nm-legend { display: none; margin-top: 6px; font-size: 0.82em; color: var(--secondary-text-color); }
+        .nm-legend-row { display: inline-flex; align-items: center; gap: 6px; margin-right: 12px; margin-top: 4px; }
+        .nm-legend-swatch { width: 18px; height: 4px; border-radius: 999px; display: inline-block; }
+        .nm-history { display: none; margin-top: 8px; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 0.85em; }
+        .nm-history button { border: none; border-radius: 8px; padding: 7px 10px; font-weight: 700; cursor: pointer; background: var(--secondary-background-color); color: var(--primary-text-color); }
+        .nm-history button.active { background: var(--primary-color); color: var(--text-primary-color); }
         .nm-cal { display: none; margin-top: 8px; padding: 8px; border-radius: 8px;
           background: var(--secondary-background-color); font-size: 0.85em; }
         .nm-cal pre { white-space: pre-wrap; margin: 6px 0 0; font-family: monospace; }
-        .nm-cal button { margin-top: 6px; border: none; border-radius: 8px; padding: 7px 10px;
+        .nm-cal button { margin-top: 6px; margin-right: 6px; border: none; border-radius: 8px; padding: 7px 10px;
           font-weight: 700; cursor: pointer; background: var(--primary-color); color: var(--text-primary-color); }
         .nm-controls { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
         .nm-btn { border: none; border-radius: 12px; padding: 11px 8px; font-weight: 700;
@@ -180,6 +219,7 @@ class NavimowMapCard extends HTMLElement {
       </style>`;
     this._bindControls();
     this._bindGestures();
+    this._bindHistoryControls();
   }
 
   set hass(hass) {
@@ -247,8 +287,18 @@ class NavimowMapCard extends HTMLElement {
 
     el.style.display = 'block';
     const clicks = this._calibrationClicks || [];
-    const yaml = clicks.length === 2
-      ? `calibration:\n  - m: [${clicks[0].m[0].toFixed(3)}, ${clicks[0].m[1].toFixed(3)}]\n    px: [${Math.round(clicks[0].px[0])}, ${Math.round(clicks[0].px[1])}]\n  - m: [${clicks[1].m[0].toFixed(3)}, ${clicks[1].m[1].toFixed(3)}]\n    px: [${Math.round(clicks[1].px[0])}, ${Math.round(clicks[1].px[1])}]`
+    const calibration = clicks.length === 2 ? [
+      {
+        m: [Number(clicks[0].m[0].toFixed(3)), Number(clicks[0].m[1].toFixed(3))],
+        px: [Math.round(clicks[0].px[0]), Math.round(clicks[0].px[1])],
+      },
+      {
+        m: [Number(clicks[1].m[0].toFixed(3)), Number(clicks[1].m[1].toFixed(3))],
+        px: [Math.round(clicks[1].px[0]), Math.round(clicks[1].px[1])],
+      },
+    ] : null;
+    const yaml = calibration
+      ? `calibration:\n  - m: [${calibration[0].m[0]}, ${calibration[0].m[1]}]\n    px: [${calibration[0].px[0]}, ${calibration[0].px[1]}]\n  - m: [${calibration[1].m[0]}, ${calibration[1].m[1]}]\n    px: [${calibration[1].px[0]}, ${calibration[1].px[1]}]`
       : '';
 
     el.innerHTML = `
@@ -256,8 +306,28 @@ class NavimowMapCard extends HTMLElement {
       Click two known points on the map image. At each click, the card stores the clicked image pixel and the mower's current RTK X/Y position.<br>
       Points selected: <b>${clicks.length}/2</b>
       ${clicks.map((p, i) => `<br>Point ${i + 1}: m=[${p.m[0].toFixed(3)}, ${p.m[1].toFixed(3)}], px=[${Math.round(p.px[0])}, ${Math.round(p.px[1])}]`).join('')}
-      ${yaml ? `<pre>${yaml}</pre><button type="button" class="nm-reset-cal">Reset points</button>` : `<br><button type="button" class="nm-reset-cal">Reset points</button>`}
+      ${yaml ? `<pre>${yaml}</pre><button type="button" class="nm-apply-cal">Apply calibration</button><button type="button" class="nm-reset-cal">Reset points</button>` : `<br><button type="button" class="nm-reset-cal">Reset points</button>`}
+      <br><small>Apply calibration updates the card config when Home Assistant is listening for custom-card config changes, typically while editing the card. On a normal dashboard view, use the displayed YAML if the Apply button is not persisted.</small>
     `;
+
+    const apply = el.querySelector('.nm-apply-cal');
+    if (apply && calibration) {
+      apply.onclick = () => {
+        const cfg = JSON.parse(JSON.stringify(this._config || {}));
+        cfg.calibration = calibration;
+        cfg.calibration_mode = false;
+        this._config = cfg;
+        this._cal = this._solveCalibration(cfg.calibration);
+        this.dispatchEvent(new CustomEvent('config-changed', {
+          detail: { config: cfg },
+          bubbles: true,
+          composed: true,
+        }));
+        this._updateCalibrationUi();
+        this._update();
+      };
+    }
+
     const reset = el.querySelector('.nm-reset-cal');
     if (reset) {
       reset.onclick = () => {
@@ -500,6 +570,214 @@ class NavimowMapCard extends HTMLElement {
     return last + (first - last) * t;
   }
 
+  _sessionFilterConfig() {
+    const f = this._config.session_filter || {};
+    const mode = (f.mode || 'count').toString().toLowerCase();
+    return {
+      mode: ['count', 'today', 'today_or_count'].includes(mode) ? mode : 'count',
+      resetTime: f.reset_time || '03:00',
+    };
+  }
+
+  _parseResetTime(resetTime) {
+    const m = String(resetTime || '03:00').match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return { h: 3, min: 0 };
+    return {
+      h: Math.max(0, Math.min(23, parseInt(m[1], 10))),
+      min: Math.max(0, Math.min(59, parseInt(m[2], 10))),
+    };
+  }
+
+  _sessionFilterStartMs(nowMs = Date.now()) {
+    const f = this._sessionFilterConfig();
+    if (f.mode === 'count') return null;
+    const now = new Date(nowMs);
+    const { h, min } = this._parseResetTime(f.resetTime);
+    const start = new Date(now);
+    start.setHours(h, min, 0, 0);
+    if (now.getTime() < start.getTime()) start.setDate(start.getDate() - 1);
+    return start.getTime();
+  }
+
+
+  _historyViewConfig() {
+    const h = this._config.history_view || {};
+    return {
+      enabled: !!h.enabled,
+      daysBack: Math.max(0, Math.min(31, Number.isFinite(Number(h.days_back)) ? Number(h.days_back) : 4)),
+      showLiveMarkerWhenHistory: !!h.show_live_marker_when_history,
+    };
+  }
+
+  _isPastHistoryView() {
+    return this._historyViewConfig().enabled && (this._historyDayOffset || 0) > 0;
+  }
+
+  _historyWindowMs(offset = 0, nowMs = Date.now()) {
+    const f = this._sessionFilterConfig();
+    const { h, min } = this._parseResetTime(f.resetTime);
+    const now = new Date(nowMs);
+    const start = new Date(now);
+    start.setHours(h, min, 0, 0);
+    if (now.getTime() < start.getTime()) start.setDate(start.getDate() - 1);
+    start.setDate(start.getDate() - Math.max(0, offset || 0));
+    const end = new Date(start);
+    end.setDate(end.getDate() + 1);
+    const startMs = start.getTime();
+    const endMs = offset > 0 ? end.getTime() : nowMs;
+    return { start: startMs, end: endMs };
+  }
+
+  _sessionWindowMs() {
+    const history = this._historyViewConfig();
+    if (history.enabled) return this._historyWindowMs(this._historyDayOffset || 0);
+    const start = this._sessionFilterStartMs();
+    return start === null ? null : { start, end: null };
+  }
+
+  _historyLabel(offset) {
+    if (offset === 0) return 'Today';
+    if (offset === 1) return 'Yesterday';
+    return `${offset} days ago`;
+  }
+
+  _renderHistoryControls() {
+    const el = this.querySelector('.nm-history');
+    if (!el) return;
+    const cfg = this._historyViewConfig();
+    if (!cfg.enabled) {
+      el.style.display = 'none';
+      el.innerHTML = '';
+      return;
+    }
+    el.style.display = 'flex';
+    const max = cfg.daysBack;
+    const buttons = [];
+    for (let i = 0; i <= max; i++) {
+      buttons.push(`<button type="button" data-history-offset="${i}" class="${i === (this._historyDayOffset || 0) ? 'active' : ''}">${this._historyLabel(i)}</button>`);
+    }
+    el.innerHTML = buttons.join('');
+  }
+
+  _setHistoryDayOffset(offset) {
+    const cfg = this._historyViewConfig();
+    const next = Math.max(0, Math.min(cfg.daysBack, Number(offset) || 0));
+    if (next === (this._historyDayOffset || 0)) return;
+    this._historyDayOffset = next;
+    this._histLoaded = false;
+    this._sessions = [];
+    this._trail = [];
+    this._currentSessionStart = null;
+    this._lastKey = null;
+    this._renderHistoryControls();
+    if (this._hass) this._loadSessionHistory();
+    this._update();
+  }
+
+  _filterAndLimitSessions(sessions) {
+    const c = this._config || {};
+    const f = this._sessionFilterConfig();
+    const history = this._historyViewConfig();
+    let out = (sessions || []).filter(s => s && s.points && s.points.length);
+    const window = this._sessionWindowMs();
+    if (window && window.start !== null && window.start !== undefined) {
+      out = out.filter(s => !s.start || s.start >= window.start);
+    }
+    if (window && window.end !== null && window.end !== undefined) {
+      out = out.filter(s => !s.start || s.start < window.end);
+    }
+    if (!history.enabled && (f.mode === 'count' || f.mode === 'today_or_count')) {
+      out = out.slice(-Math.max(0, c.session_count || 0));
+    }
+    if (history.enabled && (this._historyDayOffset || 0) === 0 && f.mode === 'today_or_count') {
+      out = out.slice(-Math.max(0, c.session_count || 0));
+    }
+    return out;
+  }
+
+  _formatSessionTime(ms) {
+    if (!ms) return '—';
+    try {
+      return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } catch (e) {
+      return '—';
+    }
+  }
+
+  _sessionGapMs() {
+    // If Recorder does not contain clean mower state intervals, split
+    // historical trails by long gaps between X/Y samples. This makes previous
+    // days visible even if HA restarted or the mower resumed an already running
+    // task during the selected day.
+    return Math.max(5, Number(this._config.session_gap_minutes || 20)) * 60 * 1000;
+  }
+
+  _sessionInterruptGraceMs() {
+    // Short HA unavailable/unknown blips are common when an integration reloads
+    // or reconnects. Do not let a 1-2 second state flap split one mowing cycle
+    // into multiple history sessions.
+    return Math.max(0, Number(this._config.session_interrupt_grace_minutes ?? 5)) * 60 * 1000;
+  }
+
+  _cleanHistoryStateEvents(st) {
+    const raw = (st || [])
+      .map(ev => ({ t: this._historyEventTime(ev), state: ev && ev.s }))
+      .filter(ev => ev.t !== null && ev.state !== null && ev.state !== undefined)
+      .sort((a, b) => a.t - b.t);
+
+    const cleaned = [];
+    const transientStates = new Set(['unavailable', 'unknown']);
+    const grace = this._sessionInterruptGraceMs();
+
+    for (let i = 0; i < raw.length; i++) {
+      const ev = raw[i];
+      if (transientStates.has(ev.state)) {
+        let j = i + 1;
+        while (j < raw.length && transientStates.has(raw[j].state)) j++;
+        const next = raw[j] || null;
+        const prev = cleaned.length ? cleaned[cleaned.length - 1] : null;
+        const duration = next ? (next.t - ev.t) : Number.POSITIVE_INFINITY;
+
+        // Skip short unavailable/unknown periods. The next real state will
+        // restore the entity state, and duplicate same-state events are merged
+        // below. This fixes mowing -> unavailable -> mowing being counted as
+        // two sessions.
+        if (duration <= grace && (prev || next)) continue;
+      }
+
+      const last = cleaned.length ? cleaned[cleaned.length - 1] : null;
+      if (last && last.state === ev.state) continue;
+      cleaned.push(ev);
+    }
+    return cleaned;
+  }
+
+  _updateTrailLegend(drawSessions, trailCfg) {
+    const el = this.querySelector('.nm-legend');
+    if (!el) return;
+    if (!this._config.trail_legend) {
+      el.style.display = 'none';
+      el.innerHTML = '';
+      return;
+    }
+    const sessions = (drawSessions || []).filter(s => s.points && s.points.length > 1);
+    if (!sessions.length) {
+      el.style.display = 'none';
+      el.innerHTML = '';
+      return;
+    }
+    const historyCount = Math.max(0, sessions.length - 1);
+    el.style.display = 'block';
+    el.innerHTML = sessions.map((sess, idx) => {
+      const isCurrent = idx === sessions.length - 1;
+      const ageFromNewest = sessions.length - 1 - idx;
+      const opacity = isCurrent ? trailCfg.active.opacity : this._historyTrailOpacity(ageFromNewest, historyCount, trailCfg);
+      const color = isCurrent ? trailCfg.active.color : trailCfg.previous.color;
+      const label = isCurrent ? `Current (${this._formatSessionTime(sess.start)})` : this._formatSessionTime(sess.start);
+      return `<span class="nm-legend-row"><span class="nm-legend-swatch" style="background:${color};opacity:${Math.max(0, Math.min(1, opacity)).toFixed(2)}"></span>${label}</span>`;
+    }).join('');
+  }
+
   _zoneName(zone) {
     const names = this._config.zone_names || {};
     if (zone === null || zone === undefined || zone === 'unknown' || zone === 'unavailable') return '—';
@@ -508,10 +786,11 @@ class NavimowMapCard extends HTMLElement {
 
   _startNewSession() {
     if (this._trail && this._trail.length) {
-      this._sessions.push({ points: this._trail });
-      this._sessions = this._sessions.slice(-Math.max(0, this._config.session_count - 1));
+      this._sessions.push({ points: this._trail, start: this._currentSessionStart || Date.now() });
+      this._sessions = this._filterAndLimitSessions(this._sessions).slice(-Math.max(0, this._config.session_count - 1));
     }
     this._trail = [];
+    this._currentSessionStart = Date.now();
     this._lastKey = null;
   }
 
@@ -531,16 +810,64 @@ class NavimowMapCard extends HTMLElement {
     });
   }
 
+
+  _bindHistoryControls() {
+    const host = this;
+    if (this._historyControlsBound) return;
+    this._historyControlsBound = true;
+    this.addEventListener('click', (e) => {
+      const btn = e.target && e.target.closest ? e.target.closest('button[data-history-offset]') : null;
+      if (!btn || !host.contains(btn)) return;
+      e.preventDefault();
+      host._setHistoryDayOffset(parseInt(btn.dataset.historyOffset, 10));
+    });
+  }
+
+  _historyEventTime(ev) {
+    if (!ev) return null;
+    let v = ev.lu ?? ev.lc ?? ev.last_updated ?? ev.last_changed ?? ev.last_updated_time ?? ev.last_changed_time;
+    if (v === null || v === undefined) return null;
+    if (typeof v === 'number') {
+      // HA history may return seconds in some compact responses and
+      // milliseconds in others. Normalize to milliseconds.
+      return v < 1000000000000 ? v * 1000 : v;
+    }
+    if (typeof v === 'string') {
+      const n = Number(v);
+      if (Number.isFinite(n)) return n < 1000000000000 ? n * 1000 : n;
+      const d = Date.parse(v);
+      return Number.isFinite(d) ? d : null;
+    }
+    return null;
+  }
+
   // Rebuild recent session paths from HA's recorder.
   async _loadSessionHistory() {
     const c = this._config, hass = this._hass;
     try {
-      const end = new Date();
-      const start = new Date(Date.now() - c.history_hours * 3600e3);
+      const historyCfg = this._historyViewConfig();
+      const selectedWindow = this._sessionWindowMs();
+      const filterStartMs = selectedWindow ? selectedWindow.start : null;
+      const filterEndMs = selectedWindow ? selectedWindow.end : null;
+
+      // For history day selector we fetch exactly the selected mowing day, plus
+      // a small lookback so we can infer whether a mower was already mowing at
+      // the day boundary. For count mode, keep the old history_hours behavior.
+      let requestStartMs;
+      let requestEndMs;
+      if (historyCfg.enabled && filterStartMs !== null) {
+        requestStartMs = filterStartMs - 2 * 3600e3;
+        requestEndMs = filterEndMs || Date.now();
+      } else {
+        const historyStartMs = Date.now() - (c.history_hours || 24) * 3600e3;
+        requestStartMs = filterStartMs === null ? historyStartMs : Math.min(historyStartMs, filterStartMs - 2 * 3600e3);
+        requestEndMs = filterEndMs || Date.now();
+      }
+
       const r = await hass.callWS({
         type: 'history/history_during_period',
-        start_time: start.toISOString(),
-        end_time: end.toISOString(),
+        start_time: new Date(requestStartMs).toISOString(),
+        end_time: new Date(requestEndMs).toISOString(),
         entity_ids: [c.status_entity, c.x_entity, c.y_entity],
         minimal_response: true,
         no_attributes: true,
@@ -550,42 +877,130 @@ class NavimowMapCard extends HTMLElement {
       const xs = (r && r[c.x_entity]) || [];
       const ys = (r && r[c.y_entity]) || [];
 
-      let starts = [];
-      for (let i = 1; i < st.length; i++) {
-        if (st[i].s === 'mowing' && st[i - 1].s === 'docked') starts.push(st[i].lu);
-      }
-      if (!starts.length) return;
-      starts = starts.slice(-Math.max(1, c.session_count));
-
+      // Build paired X/Y points from recorder history.
       const allPts = [];
       let yi = 0, lastY = null;
       for (const ex of xs) {
         const x = parseFloat(ex.s);
-        while (yi < ys.length && ys[yi].lu <= ex.lu) {
+        while (yi < ys.length && this._historyEventTime(ys[yi]) !== null && this._historyEventTime(ys[yi]) <= this._historyEventTime(ex)) {
           const v = parseFloat(ys[yi].s);
           if (!isNaN(v)) lastY = v;
           yi++;
         }
-        if (!isNaN(x) && lastY !== null) allPts.push({ t: ex.lu, p: [x, lastY] });
+        if (!isNaN(x) && lastY !== null) {
+          const t = this._historyEventTime(ex);
+          if (t !== null && (filterStartMs === null || t >= filterStartMs) && (filterEndMs === null || filterEndMs === undefined || t < filterEndMs)) {
+            allPts.push({ t, p: [x, lastY] });
+          }
+        }
       }
 
-      const sessions = [];
-      for (let i = 0; i < starts.length; i++) {
-        const t0 = starts[i];
-        const t1 = starts[i + 1] || Number.POSITIVE_INFINITY;
-        let pts = allPts.filter(o => o.t >= t0 && o.t < t1).map(o => o.p);
-        if (pts.length) sessions.push({ points: this._decimate(pts, c.trail_length), start: t0 });
+      // Fallback for HA history variants where X and Y updates are not aligned
+      // in the compact response. Pair each X with the latest known Y, and if that
+      // still produced no points, pair nearest X/Y updates within a short window.
+      if (!allPts.length && xs.length && ys.length) {
+        const xEvents = xs.map(e => ({ t: this._historyEventTime(e), v: parseFloat(e.s) }))
+          .filter(e => e.t !== null && !isNaN(e.v));
+        const yEvents = ys.map(e => ({ t: this._historyEventTime(e), v: parseFloat(e.s) }))
+          .filter(e => e.t !== null && !isNaN(e.v));
+        let j = 0;
+        for (const xe of xEvents) {
+          while (j + 1 < yEvents.length && yEvents[j + 1].t <= xe.t) j++;
+          const candidates = [yEvents[j], yEvents[j + 1]].filter(Boolean);
+          let best = null;
+          for (const ye of candidates) {
+            if (!best || Math.abs(ye.t - xe.t) < Math.abs(best.t - xe.t)) best = ye;
+          }
+          if (best && Math.abs(best.t - xe.t) <= 5 * 60 * 1000) {
+            const t = Math.max(xe.t, best.t);
+            if ((filterStartMs === null || t >= filterStartMs) && (filterEndMs === null || filterEndMs === undefined || t < filterEndMs)) {
+              allPts.push({ t, p: [xe.v, best.v] });
+            }
+          }
+        }
+      }
+
+      // Prefer explicit mowing intervals from the lawn_mower entity, but clean
+      // the state history first. Home Assistant/integration reloads can create
+      // very short mowing -> unavailable -> mowing blips; those are not real
+      // mowing cycles and should not become separate legend entries.
+      const intervals = [];
+      const stateEvents = this._cleanHistoryStateEvents(st);
+      let currentStart = null;
+      const closingStates = new Set(['docked', 'idle', 'error', 'unavailable', 'unknown']);
+
+      for (const ev of stateEvents) {
+        const t = ev.t;
+        const state = ev.state;
+
+        if (state === 'mowing' && currentStart === null) {
+          currentStart = t;
+          continue;
+        }
+
+        // Do not split a cycle on paused/returning. A cycle is considered over
+        // when the mower reaches docked/idle or when a long unavailable/error
+        // period starts.
+        if (currentStart !== null && closingStates.has(state)) {
+          if (t > currentStart) intervals.push({ start: currentStart, end: t });
+          currentStart = null;
+        }
+      }
+      if (currentStart !== null) {
+        intervals.push({ start: currentStart, end: requestEndMs });
+      }
+
+      let sessions = [];
+      for (const interval of intervals) {
+        const start = Math.max(interval.start, filterStartMs || interval.start);
+        const end = filterEndMs ? Math.min(interval.end, filterEndMs) : interval.end;
+        const pts = allPts.filter(o => o.t >= start && o.t < end).map(o => o.p);
+        if (pts.length > 1) sessions.push({ points: this._decimate(pts, c.trail_length), start });
+      }
+
+      // Fallback: if state transitions are incomplete, group all X/Y points by
+      // time gaps. This is what makes older history days show up reliably.
+      if (!sessions.length && allPts.length > 1) {
+        let group = [];
+        let groupStart = allPts[0].t;
+        const gap = this._sessionGapMs();
+        for (let i = 0; i < allPts.length; i++) {
+          const item = allPts[i];
+          if (group.length && item.t - allPts[i - 1].t > gap) {
+            if (group.length > 1) sessions.push({ points: this._decimate(group.map(o => o.p), c.trail_length), start: groupStart });
+            group = [];
+            groupStart = item.t;
+          }
+          group.push(item);
+        }
+        if (group.length > 1) sessions.push({ points: this._decimate(group.map(o => o.p), c.trail_length), start: groupStart });
       }
 
       if (sessions.length) {
-        const newest = sessions[sessions.length - 1];
-        this._sessions = sessions.slice(0, -1).slice(-Math.max(0, c.session_count - 1));
-        this._trail = this._decimate(newest.points.concat(this._trail), c.trail_length);
+        const filtered = this._filterAndLimitSessions(sessions);
+        if (historyCfg.enabled && (this._historyDayOffset || 0) > 0) {
+          this._sessions = filtered;
+          this._trail = [];
+          this._currentSessionStart = null;
+        } else {
+          const newest = filtered[filtered.length - 1];
+          this._sessions = this._filterAndLimitSessions(filtered.slice(0, -1)).slice(-Math.max(0, c.session_count - 1));
+          if (newest) {
+            this._currentSessionStart = newest.start || this._currentSessionStart;
+            this._trail = this._decimate(newest.points.concat(this._trail), c.trail_length);
+          }
+        }
         this._lastKey = null;
-        this._update();
+      } else if (historyCfg.enabled && (this._historyDayOffset || 0) > 0) {
+        this._sessions = [];
+        this._trail = [];
+        this._currentSessionStart = null;
       }
+      this._update();
     } catch (e) {
       // recorder disabled or entities excluded -> live-only trail
+      // Keep this quiet in normal dashboards; bad recorder config should not
+      // break the card.
     }
   }
 
@@ -594,6 +1009,15 @@ class NavimowMapCard extends HTMLElement {
     const c = this._config;
     const controls = this.querySelector('.nm-controls');
     if (controls) controls.style.display = c.show_controls ? 'grid' : 'none';
+    const currentFilterStart = this._sessionFilterStartMs();
+    if (currentFilterStart !== null && this._lastSessionFilterStart !== null && currentFilterStart > this._lastSessionFilterStart) {
+      this._sessions = [];
+      this._trail = [];
+      this._currentSessionStart = null;
+      this._lastKey = null;
+    }
+    this._lastSessionFilterStart = currentFilterStart;
+    this._renderHistoryControls();
     this._updateCalibrationUi();
     const x = this._num(c.x_entity);
     const y = this._num(c.y_entity);
@@ -609,13 +1033,14 @@ class NavimowMapCard extends HTMLElement {
     const batt = c.battery_entity ? this._num(c.battery_entity) : null;
 
     // new mowing session (docked -> mowing) -> reset the path
-    if (this._prevState === 'docked' && status === 'mowing') {
+    if (!this._isPastHistoryView() && this._prevState === 'docked' && status === 'mowing') {
       this._startNewSession();
     }
     this._prevState = status;
 
-    if (x !== null && y !== null) {
+    if (!this._isPastHistoryView() && x !== null && y !== null) {
       const key = x.toFixed(3) + ',' + y.toFixed(3);
+      if (!this._currentSessionStart) this._currentSessionStart = Date.now();
       if (key !== this._lastKey) {
         this._trail.push([x, y]);
         this._lastKey = key;
@@ -654,6 +1079,7 @@ class NavimowMapCard extends HTMLElement {
       (x !== null && y !== null) ? `Pos: <b>${x.toFixed(1)}, ${y.toFixed(1)} m</b>` : `Pos: <b>—</b>`,
     ];
     if (batt !== null) parts.push(`Battery: <b>${batt}%</b>`);
+    if (this._historyViewConfig().enabled) parts.push(`View: <b>${this._historyLabel(this._historyDayOffset || 0)}</b>`);
     this.querySelector('.nm-ftr').innerHTML = parts.join('');
 
     const dock = (c.dock_x !== null && c.dock_y !== null)
@@ -661,7 +1087,8 @@ class NavimowMapCard extends HTMLElement {
       : haveSensorDock
         ? [sensorDockX, sensorDockY]
         : (this._dock || [0, 0]);
-    this._draw(x, y, headingDeg, dock);
+    const showLiveInHistory = !this._isPastHistoryView() || this._historyViewConfig().showLiveMarkerWhenHistory;
+    this._draw(showLiveInHistory ? x : null, showLiveInHistory ? y : null, showLiveInHistory ? headingDeg : null, dock);
   }
 
   _draw(x, y, headingDeg, dock) {
@@ -684,9 +1111,11 @@ class NavimowMapCard extends HTMLElement {
     }
     const overlayReady = !!(this._imgMeta && this._cal);
 
-    if (!overlayReady && pts.length === 0 && (x === null || y === null)) {
+    const historyPtsForEmptyCheck = (this._sessions || []).flatMap(sess => sess.points || []);
+    if (!overlayReady && pts.length === 0 && historyPtsForEmptyCheck.length === 0 && (x === null || y === null)) {
       this._applyViewBox();
       svg.innerHTML = `<text x="${V/2}" y="${V/2}" fill="var(--secondary-text-color)" font-size="34" text-anchor="middle">Waiting for position…</text>`;
+      this._updateTrailLegend([], this._trailConfig());
       return;
     }
 
@@ -781,9 +1210,16 @@ class NavimowMapCard extends HTMLElement {
 
     // Draw older sessions first, newest/current last so it stays on top.
     const trailCfg = this._trailConfig();
-    const allSessions = (this._sessions || []).concat([{ points: pts, current: true }]);
+    let filteredHistory = this._filterAndLimitSessions(this._sessions || []);
+    if (this._sessionFilterConfig().mode !== 'today') {
+      filteredHistory = filteredHistory.slice(-Math.max(0, (this._config.session_count || 0) - 1));
+    }
+    const allSessions = this._isPastHistoryView()
+      ? filteredHistory
+      : filteredHistory.concat([{ points: pts, current: true, start: this._currentSessionStart }]);
     const drawSessions = allSessions.filter(sess => sess.points && sess.points.length > 1);
     const historyCount = Math.max(0, drawSessions.length - 1);
+    this._updateTrailLegend(drawSessions, trailCfg);
     drawSessions.forEach((sess, idx) => {
       const sp = sess.points.map(p => M2W(p[0], p[1]));
       const d = sp.map((p, i) => `${i === 0 ? 'M' : 'L'}${tx(p[0]).toFixed(1)} ${ty(p[1]).toFixed(1)}`).join(' ');
@@ -872,10 +1308,214 @@ class NavimowMapCard extends HTMLElement {
   getCardSize() { return 6; }
 }
 
+
+class NavimowMapCardEditor extends HTMLElement {
+  setConfig(config) {
+    this._config = Object.assign({}, config || {});
+    this._render();
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    if (this._form) this._form.hass = hass;
+    else this._render();
+  }
+
+  _entitySelector(domain, multiple = false) {
+    const sel = { entity: {} };
+    if (domain) sel.entity.domain = domain;
+    if (multiple) sel.entity.multiple = true;
+    return sel;
+  }
+
+  _schema() {
+    return [
+      { name: 'title', label: 'Title', selector: { text: {} } },
+      { name: 'status_entity', label: 'Mower entity', selector: this._entitySelector('lawn_mower') },
+      { name: 'x_entity', label: 'Position X sensor', selector: this._entitySelector('sensor') },
+      { name: 'y_entity', label: 'Position Y sensor', selector: this._entitySelector('sensor') },
+      { name: 'heading_entity', label: 'Heading sensor', selector: this._entitySelector('sensor') },
+      { name: 'zone_entity', label: 'Zone sensor', selector: this._entitySelector('sensor') },
+      { name: 'battery_entity', label: 'Battery sensor', selector: this._entitySelector('sensor') },
+      { name: 'show_controls', label: 'Show Mow / Pause / Dock buttons', selector: { boolean: {} } },
+      { name: 'enable_zoom', label: 'Enable zoom and pan', selector: { boolean: {} } },
+      { name: 'overlay_image', label: 'Overlay image path', selector: { text: {} } },
+      { name: 'overlay_opacity', label: 'Overlay opacity', selector: { number: { min: 0, max: 1, step: 0.05, mode: 'box' } } },
+      { name: 'straighten', label: 'Keep aerial photo upright (off = rotate the aerial image instead)', selector: { boolean: {} } },
+      { name: 'calibration_mode', label: 'Calibration mode', selector: { boolean: {} } },
+      { name: 'history_hours', label: 'Recorder history hours', selector: { number: { min: 1, max: 744, step: 1, mode: 'box' } } },
+      { name: 'session_count', label: 'Session count', selector: { number: { min: 1, max: 50, step: 1, mode: 'box' } } },
+      { name: 'session_gap_minutes', label: 'Split sessions after gap (minutes)', selector: { number: { min: 5, max: 180, step: 5, mode: 'box' } } },
+      { name: 'session_interrupt_grace_minutes', label: 'Ignore unavailable blips shorter than (minutes)', selector: { number: { min: 0, max: 30, step: 1, mode: 'box' } } },
+      { name: 'session_filter_mode', label: 'Session filter mode', selector: { select: { options: ['count', 'today', 'today_or_count'] } } },
+      { name: 'session_filter_reset_time', label: 'Mowing day reset time', selector: { text: {} } },
+      { name: 'trail_legend', label: 'Show trail legend', selector: { boolean: {} } },
+      { name: 'history_view_enabled', label: 'Enable history day selector', selector: { boolean: {} } },
+      { name: 'history_view_days_back', label: 'History days back', selector: { number: { min: 0, max: 31, step: 1, mode: 'box' } } },
+      { name: 'history_view_show_live_marker', label: 'Show live mower marker on older days', selector: { boolean: {} } },
+      { name: 'channel_entities', label: 'Channel binary sensors', selector: this._entitySelector('binary_sensor', true) },
+      { name: 'active_trail_color', label: 'Active trail color', selector: { text: {} } },
+      { name: 'active_trail_opacity', label: 'Active trail opacity', selector: { number: { min: 0, max: 1, step: 0.05, mode: 'box' } } },
+      { name: 'active_trail_width', label: 'Active trail width', selector: { number: { min: 0.5, max: 20, step: 0.1, mode: 'box' } } },
+      { name: 'previous_trail_color', label: 'Previous trail color', selector: { text: {} } },
+      { name: 'previous_trail_width', label: 'Previous trail width', selector: { number: { min: 0.5, max: 20, step: 0.1, mode: 'box' } } },
+      { name: 'previous_opacity_first', label: 'Previous opacity first', selector: { number: { min: 0, max: 1, step: 0.05, mode: 'box' } } },
+      { name: 'previous_opacity_last', label: 'Previous opacity last', selector: { number: { min: 0, max: 1, step: 0.05, mode: 'box' } } },
+      { name: 'fade_mode', label: 'Trail fade mode', selector: { select: { options: ['linear', 'exponential'] } } },
+      { name: 'channel_fill', label: 'Channel fill', selector: { text: {} } },
+      { name: 'channel_stroke', label: 'Channel stroke', selector: { text: {} } },
+      { name: 'channel_width', label: 'Channel width', selector: { number: { min: 0.5, max: 20, step: 0.1, mode: 'box' } } },
+      { name: 'robot_scale', label: 'Robot scale', selector: { number: { min: 0.2, max: 3, step: 0.1, mode: 'box' } } },
+      { name: 'dock_scale', label: 'Dock scale', selector: { number: { min: 0.2, max: 3, step: 0.1, mode: 'box' } } },
+      { name: 'dock_icon', label: 'Dock icon', selector: { icon: {} } },
+    ];
+  }
+
+  _formDataFromConfig() {
+    const c = this._config || {};
+    const sf = c.session_filter || {};
+    const hv = c.history_view || {};
+    const appearance = c.appearance || {};
+    const trails = appearance.trails || c.trails || {};
+    const active = trails.active || {};
+    const previous = trails.previous || {};
+    const prevOpacity = previous.opacity || {};
+    const channel = appearance.channel || {};
+    const robot = appearance.robot || {};
+    const dock = appearance.dock || {};
+    return {
+      title: c.title,
+      status_entity: c.status_entity,
+      x_entity: c.x_entity,
+      y_entity: c.y_entity,
+      heading_entity: c.heading_entity,
+      zone_entity: c.zone_entity,
+      battery_entity: c.battery_entity,
+      show_controls: c.show_controls !== false,
+      enable_zoom: c.enable_zoom !== false,
+      overlay_image: c.overlay_image,
+      overlay_opacity: c.overlay_opacity,
+      calibration_mode: !!c.calibration_mode,
+      history_hours: c.history_hours,
+      session_count: c.session_count,
+      session_gap_minutes: c.session_gap_minutes,
+      session_interrupt_grace_minutes: c.session_interrupt_grace_minutes,
+      straighten: c.straighten,
+      session_filter_mode: sf.mode || 'count',
+      session_filter_reset_time: sf.reset_time || '03:00',
+      trail_legend: !!c.trail_legend,
+      history_view_enabled: !!hv.enabled,
+      history_view_days_back: hv.days_back ?? 4,
+      history_view_show_live_marker: !!hv.show_live_marker_when_history,
+      channel_entities: Array.isArray(c.channel_entities) ? c.channel_entities : [],
+      active_trail_color: active.color,
+      active_trail_opacity: active.opacity,
+      active_trail_width: active.width,
+      previous_trail_color: previous.color,
+      previous_trail_width: previous.width,
+      previous_opacity_first: prevOpacity.first,
+      previous_opacity_last: prevOpacity.last,
+      fade_mode: trails.fade_mode || 'linear',
+      channel_fill: channel.fill,
+      channel_stroke: channel.stroke,
+      channel_width: channel.width,
+      robot_scale: robot.scale,
+      dock_scale: dock.scale,
+      dock_icon: dock.icon || 'mdi:lightning-bolt-circle',
+    };
+  }
+
+  _setIfValue(obj, key, value) {
+    if (value === undefined || value === null || value === '') delete obj[key];
+    else obj[key] = value;
+  }
+
+  _configFromFormData(data) {
+    const cfg = JSON.parse(JSON.stringify(this._config || {}));
+    const simple = [
+      'title', 'status_entity', 'x_entity', 'y_entity', 'heading_entity',
+      'zone_entity', 'battery_entity', 'show_controls', 'enable_zoom',
+      'overlay_image', 'overlay_opacity', 'straighten', 'calibration_mode', 'history_hours',
+      'session_count', 'session_gap_minutes', 'session_interrupt_grace_minutes', 'trail_legend', 'channel_entities'
+    ];
+    for (const key of simple) this._setIfValue(cfg, key, data[key]);
+
+    cfg.session_filter = cfg.session_filter || {};
+    this._setIfValue(cfg.session_filter, 'mode', data.session_filter_mode);
+    this._setIfValue(cfg.session_filter, 'reset_time', data.session_filter_reset_time);
+
+    cfg.history_view = cfg.history_view || {};
+    this._setIfValue(cfg.history_view, 'enabled', data.history_view_enabled);
+    this._setIfValue(cfg.history_view, 'days_back', data.history_view_days_back);
+    this._setIfValue(cfg.history_view, 'show_live_marker_when_history', data.history_view_show_live_marker);
+
+    cfg.appearance = cfg.appearance || {};
+    cfg.appearance.trails = cfg.appearance.trails || {};
+    cfg.appearance.trails.active = cfg.appearance.trails.active || {};
+    cfg.appearance.trails.previous = cfg.appearance.trails.previous || {};
+    cfg.appearance.trails.previous.opacity = cfg.appearance.trails.previous.opacity || {};
+    this._setIfValue(cfg.appearance.trails.active, 'color', data.active_trail_color);
+    this._setIfValue(cfg.appearance.trails.active, 'opacity', data.active_trail_opacity);
+    this._setIfValue(cfg.appearance.trails.active, 'width', data.active_trail_width);
+    this._setIfValue(cfg.appearance.trails.previous, 'color', data.previous_trail_color);
+    this._setIfValue(cfg.appearance.trails.previous, 'width', data.previous_trail_width);
+    this._setIfValue(cfg.appearance.trails.previous.opacity, 'first', data.previous_opacity_first);
+    this._setIfValue(cfg.appearance.trails.previous.opacity, 'last', data.previous_opacity_last);
+    this._setIfValue(cfg.appearance.trails, 'fade_mode', data.fade_mode);
+
+    cfg.appearance.channel = cfg.appearance.channel || {};
+    this._setIfValue(cfg.appearance.channel, 'fill', data.channel_fill);
+    this._setIfValue(cfg.appearance.channel, 'stroke', data.channel_stroke);
+    this._setIfValue(cfg.appearance.channel, 'width', data.channel_width);
+
+    cfg.appearance.robot = cfg.appearance.robot || {};
+    this._setIfValue(cfg.appearance.robot, 'scale', data.robot_scale);
+    cfg.appearance.dock = cfg.appearance.dock || {};
+    this._setIfValue(cfg.appearance.dock, 'scale', data.dock_scale);
+    this._setIfValue(cfg.appearance.dock, 'icon', data.dock_icon);
+    return cfg;
+  }
+
+  _render() {
+    if (!this._hass || !this._config) return;
+    if (!this._form) {
+      this.innerHTML = `<ha-form></ha-form>`;
+      this._form = this.querySelector('ha-form');
+      this._form.schema = this._schema();
+      this._form.computeLabel = (schema) => schema.label || schema.name;
+      this._form.addEventListener('value-changed', (ev) => {
+        const cfg = this._configFromFormData(ev.detail.value || {});
+        this._config = cfg;
+        this.dispatchEvent(new CustomEvent('config-changed', { detail: { config: cfg }, bubbles: true, composed: true }));
+      });
+    }
+    this._form.hass = this._hass;
+    this._form.data = this._formDataFromConfig();
+  }
+}
+
+customElements.define('navimow-map-card-editor', NavimowMapCardEditor);
+
+NavimowMapCard.getConfigElement = function() {
+  return document.createElement('navimow-map-card-editor');
+};
+
+NavimowMapCard.getStubConfig = function() {
+  return {
+    type: 'custom:navimow-map-card',
+    title: 'Navimow Map',
+    session_filter: { mode: 'count', reset_time: '03:00' },
+    history_view: { enabled: false, days_back: 4, show_live_marker_when_history: false },
+    session_gap_minutes: 20,
+    session_interrupt_grace_minutes: 5,
+    straighten: true,
+  };
+};
+
 customElements.define('navimow-map-card', NavimowMapCard);
 window.customCards = window.customCards || [];
 window.customCards.push({
   type: 'navimow-map-card',
   name: 'Navimow Map',
-  description: 'Live Navimow position + session path, zoom, channels, and optional satellite overlay.',
+  description: 'Live Navimow position + session path, history view, daily filters, legend, zoom, channels, stable visual editor, and optional satellite overlay.',
 });
