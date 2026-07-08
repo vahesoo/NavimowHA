@@ -1,3 +1,25 @@
+# Navimow Map Card Lovelace example
+#
+# Before using this card:
+# 1. Copy `navimow-map-card.js` to your Home Assistant `/config/www/navimow/` folder.
+#    Example target path:
+#      /config/www/navimow/navimow-map-card.js
+#
+# 2. Add the card as a dashboard resource:
+#    Settings -> Dashboards -> Resources -> Add resource
+#      URL: /local/navimow/navimow-map-card.js?v=84
+#      Resource type: JavaScript module
+#
+#    If you use another folder, adjust the resource URL accordingly.
+#    For example, `/config/www/navimow-map-card.js` becomes:
+#      /local/navimow-map-card.js?v=84
+#
+# 3. After replacing the JavaScript file, always bump the `?v=` number
+#    and clear the browser / Home Assistant frontend cache if the old card
+#    is still shown.
+#
+# 4. Then add the card below to a Lovelace dashboard.
+#
 # Navimow Map Card - YAML Configuration README
 #
 # This file documents all currently supported YAML configuration options for
