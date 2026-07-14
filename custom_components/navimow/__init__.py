@@ -36,7 +36,21 @@ PLATFORMS: list[Platform] = [Platform.LAWN_MOWER, Platform.SENSOR, Platform.BINA
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload Navimow when options change."""
+    """Reload Navimow only when the user's options actually changed.
+
+    entry.add_update_listener also fires whenever HA's OAuth2 helper silently
+    rewrites the stored access/refresh token into entry.data during a
+    background token refresh (roughly hourly for Navimow). That is not an
+    options change, and reloading the whole integration on it tears down and
+    recreates every coordinator/entity for a second or two each time it
+    happens. So compare against the options we last saw and only reload if
+    they actually differ.
+    """
+    snapshot = hass.data[DOMAIN].setdefault("_options_snapshot", {})
+    previous_options = snapshot.get(entry.entry_id)
+    if previous_options == entry.options:
+        return
+    snapshot[entry.entry_id] = dict(entry.options)
     await hass.config_entries.async_reload(entry.entry_id)
 
 
@@ -69,6 +83,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     from .coordinator import NavimowCoordinator
     
     hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN].setdefault("_options_snapshot", {})[entry.entry_id] = dict(entry.options)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     def _mask_secret(value: str | None) -> str:
