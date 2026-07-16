@@ -93,7 +93,7 @@ class NavimowLawnMower(CoordinatorEntity[NavimowCoordinator], LawnMowerEntity):
         transient; the entity should not flip to unavailable during the
         brief reconnection window.
         """
-        if self.coordinator.get_device_state() is not None:
+        if self.coordinator.get_device_state() is not None or self.coordinator.has_recent_good_data():
             return True
         return super().available
 
@@ -118,6 +118,8 @@ class NavimowLawnMower(CoordinatorEntity[NavimowCoordinator], LawnMowerEntity):
         attributes: dict[str, Any] = {
             "battery": state.battery,
             "status": state.state,
+            "charging_state": self.coordinator.get_charging_state(),
+            "mqtt_connected": self.coordinator.is_mqtt_connected(),
         }
         if state.signal_strength is not None:
             attributes["signal_strength"] = state.signal_strength
