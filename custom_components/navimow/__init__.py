@@ -28,7 +28,7 @@ from .const import (
 from .location import location_topic, parse_location_payload
 
 _LOGGER = logging.getLogger(__name__)
-PATCH_VERSION = "v5-zone-restore"
+PATCH_VERSION = "v7-live-position-battery-guard"
 _LOGGER.debug("Navimow module imported (__init__.py)")
 
 PLATFORMS: list[Platform] = [Platform.LAWN_MOWER, Platform.SENSOR, Platform.BINARY_SENSOR]
@@ -36,8 +36,15 @@ PLATFORMS: list[Platform] = [Platform.LAWN_MOWER, Platform.SENSOR, Platform.BINA
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload Navimow when options change."""
-    await hass.config_entries.async_reload(entry.entry_id)
+    """Intentionally do not auto-reload on config entry token updates.
+
+    Home Assistant OAuth token refreshes may update the config entry data.
+    Reloading the integration on every such update unloads all entities for a
+    second, which shows up as hourly unavailable states. Options changes that
+    affect channels/zones should be followed by a manual integration reload or
+    HA restart.
+    """
+    _LOGGER.debug("Navimow config entry updated; skipping automatic reload")
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
@@ -59,7 +66,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    _LOGGER.debug("Navimow custom patch version v5-zone-restore loaded")
+    _LOGGER.debug("Navimow custom patch version v7-live-position-battery-guard loaded")
     """Set up Navimow from a config entry."""
     # 延迟导入 mower_sdk，避免在加载 config_flow 时触发依赖导入
     from mower_sdk.api import MowerAPI
@@ -67,9 +74,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     from mower_sdk.sdk import NavimowSDK
     
     from .coordinator import NavimowCoordinator
+    from .services import async_setup_services
     
     hass.data.setdefault(DOMAIN, {})
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    # Do not register an update listener here. OAuth token refreshes can update
+    # the config entry and would otherwise cause an hourly unload/reload cycle.
 
     def _mask_secret(value: str | None) -> str:
         if not value:
@@ -179,6 +188,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         _location_cache: dict[str, dict] = {}
         _location_coordinators: dict[str, Any] = {}
+        coordinators: dict[str, NavimowCoordinator] = {}
         _mqtt_refresh_lock = asyncio.Lock()
         # 用列表作为可变标志容器，使 async_unload_entry（不同函数作用域）可以修改它
         _unload_flag: list[bool] = [False]
@@ -208,6 +218,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             mqtt.client.subscribe(location_topic(_did))
                         except Exception as _err:  # noqa: BLE001
                             _LOGGER.warning("Failed to subscribe location topic: %s", _err)
+                for _coord in list(coordinators.values()):
+                    _coord.set_mqtt_connected(True)
 
             async def _on_ready() -> None:
                 _LOGGER.debug(
@@ -228,6 +240,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 )
                 if _unload_flag[0]:
                     return
+                for _coord in list(coordinators.values()):
+                    _coord.set_mqtt_connected(False)
                 # 若已有刷新在进行中，跳过本次——broker 批量断连会并发触发多次回调，
                 # 只需执行一次凭据刷新即可，重复执行会导致 paho client 孤儿累积。
                 if _mqtt_refresh_lock.locked():
@@ -243,17 +257,70 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             async def _on_message(topic: str, payload: bytes, device_id: str) -> None:
                 payload_text = (payload or b"").decode("utf-8", errors="replace")
 
+                # Full MQTT debug logging for short test windows. Enable with:
+                # logger:
+                #   logs:
+                #     custom_components.navimow: debug
+                _LOGGER.debug(
+                    "NAVIMOW_MQTT_RAW device=%s topic=%s payload=%s",
+                    device_id,
+                    topic,
+                    payload_text,
+                )
+
                 if device_id and topic.endswith("/realtimeDate/location"):
                     try:
                         _data = json.loads(payload_text)
                     except (ValueError, TypeError):
                         _data = None
+                    _LOGGER.debug(
+                        "NAVIMOW_LOCATION_RAW device=%s parsed_type=%s item_count=%s data=%s",
+                        device_id,
+                        type(_data).__name__,
+                        len(_data) if isinstance(_data, list) else None,
+                        _data,
+                    )
                     _loc = parse_location_payload(_location_cache, device_id, _data)
                     if _loc is not None:
+                        _LOGGER.debug(
+                            "NAVIMOW_LOCATION_PARSED device=%s pose_updated=%s x=%s y=%s theta=%s pose_time=%s boundary=%s partition=%s vehicle_state=%s source_topic=%s",
+                            device_id,
+                            _loc.get("_pose_updated"),
+                            _loc.get("x"),
+                            _loc.get("y"),
+                            _loc.get("theta"),
+                            _loc.get("pose_time"),
+                            _loc.get("mow_boundary"),
+                            _loc.get("partition"),
+                            _loc.get("vehicle_state"),
+                            topic,
+                        )
                         _coord = _location_coordinators.get(device_id)
                         if _coord is not None:
                             hass.loop.call_soon_threadsafe(_coord.ingest_location, _loc)
+                    else:
+                        _LOGGER.debug(
+                            "NAVIMOW_LOCATION_IGNORED device=%s topic=%s payload=%s",
+                            device_id,
+                            topic,
+                            payload_text,
+                        )
                     return
+
+                if device_id and topic.endswith("/event"):
+                    try:
+                        _event_data = json.loads(payload_text)
+                    except (ValueError, TypeError):
+                        _event_data = {"raw": payload_text}
+                    _LOGGER.debug(
+                        "NAVIMOW_EVENT_RAW device=%s topic=%s data=%s",
+                        device_id,
+                        topic,
+                        _event_data,
+                    )
+                    _coord = _location_coordinators.get(device_id)
+                    if _coord is not None:
+                        hass.loop.call_soon_threadsafe(_coord.ingest_event, topic, _event_data)
 
                 if original_on_message is not None:
                     await original_on_message(topic, payload, device_id)
@@ -371,7 +438,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _attach_mqtt_debug_hooks(sdk, api)
         hass.async_create_task(_probe_mqtt_status(sdk))
 
-        coordinators: dict[str, NavimowCoordinator] = {}
         for device in devices:
             coordinator = NavimowCoordinator(
                 hass=hass,
@@ -384,6 +450,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await coordinator.async_config_entry_first_refresh()
             coordinators[device.id] = coordinator
             _location_coordinators[device.id] = coordinator
+            coordinator.set_mqtt_connected(bool(sdk.is_connected))
 
         async def _async_live_status_timer(_now) -> None:
             """Refresh battery/state every 120 s independently of MQTT location updates."""
@@ -406,6 +473,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "unload_flag": _unload_flag,
             "unsub_status_timer": unsub_status_timer,
         }
+
+        async_setup_services(hass)
 
         # 转发到平台
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
