@@ -20,3 +20,38 @@ set_blade_height:
           max: 60
           step: 1
           mode: slider
+
+learn_dock_position:
+  name: Learn dock position
+  description: Learn and lock the charging station position from recent valid docked mower samples. The dock will not be learned automatically.
+  fields:
+    device_id:
+      name: Device ID
+      description: Navimow device identifier.
+      required: true
+      example: "1234567890"
+      selector:
+        text:
+    sample_seconds:
+      name: Sample seconds
+      description: Optional wait time before locking the median of recent docked samples. Use 0 for immediate learning.
+      required: false
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 60
+          step: 1
+          mode: slider
+
+clear_dock_position_lock:
+  name: Clear dock position lock
+  description: Clear the manually locked dock position. Automatic dock learning remains disabled; run Learn dock position to set a new locked dock.
+  fields:
+    device_id:
+      name: Device ID
+      description: Navimow device identifier.
+      required: true
+      example: "1234567890"
+      selector:
+        text:
