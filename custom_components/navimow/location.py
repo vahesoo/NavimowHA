@@ -1,24 +1,7 @@
-"""Real-time location / zone decoding for Navimow (fork addition).
-
-The stock navimow-sdk subscribes to the .../realtimeDate/state, /event and
-/attributes MQTT channels but NOT /location, and its router drops the location
-payload (a JSON array, not a dict). This module decodes that topic so the
-integration can expose live position and the current mowing zone.
-
-Observed payload: a JSON array of objects keyed by ``type``:
-  type 1  pose     {postureX, postureY (meters), postureTheta (radians), vehicleState, time}
-  type 2  progress {currentMowBoundary (live physical partition id), currentMowProgress
-                    (route progress 0-10000, reaches 10000 at completion), mapWorkPosition}
-  type 3  zone     {partitionIds: [int]}   -> the TARGET partition (set at task start;
-                    absent for a "mow all" command)
-  type 4  delay    {taskDelay: bool}       -> rain / schedule delay
-NOTE: type 3 = target zone (drives gate pre-open); type 2 currentMowBoundary = the
-live physical zone (updates only after the mower crosses). They are kept separate.
-Coordinates are a local Cartesian grid in METERS whose origin is ~the dock /
-RTK reference (NOT latitude/longitude).
-"""
+"""Real-time location / zone decoding for Navimow (fork addition)."""
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
@@ -27,21 +10,19 @@ def location_topic(device_id: str) -> str:
     return f"/downlink/vehicle/{device_id}/realtimeDate/location"
 
 
-# Mower status values during which the pose is the dock position. "idle" is
-# deliberately excluded: the mower can sit idle mid-lawn after a manual stop.
 DOCKED_STATES = frozenset({"docked", "charging"})
-
-# Cap on the effective sample count for the dock average. Once reached, new
-# samples keep a constant 1/DOCK_MAX_SAMPLES weight, so the estimate tracks a
-# physically moved dock instead of being frozen by historical samples.
 DOCK_MAX_SAMPLES = 200
 
+# These names are intentionally conservative. Logs suggest that 2 and 3 are
+# both dock-related, but not necessarily identical. Keep raw code sensors too.
 VEHICLE_STATE_NAMES = {
+    0: "unknown",
     1: "idle",
-    2: "docked",
-    3: "paused",
+    2: "docked_state_2",
+    3: "docked_state_3",
     4: "mowing",
     5: "docking",
+    6: "mapping",
 }
 
 
@@ -51,23 +32,52 @@ def vehicle_state_name(value: Any) -> str | None:
         key = int(value)
     except (TypeError, ValueError):
         return None
-    return VEHICLE_STATE_NAMES.get(key, f"unknown_{key}")
+    return VEHICLE_STATE_NAMES.get(key, f"state_{key}")
+
+
+def valid_xy(x: Any, y: Any) -> tuple[float, float] | None:
+    """Return finite X/Y floats or None."""
+    try:
+        xf = float(x)
+        yf = float(y)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(xf) or not math.isfinite(yf):
+        return None
+    return xf, yf
+
+
+def distance_m(x1: float, y1: float, x2: float, y2: float) -> float:
+    """Return Euclidean distance in meters."""
+    return math.hypot(float(x1) - float(x2), float(y1) - float(y2))
+
+
+def normalize_progress(value: Any) -> float | None:
+    """Normalize Navimow progress values to percent.
+
+    currentMowProgress is commonly 0..10000, while some values may already be
+    0..100. Return a 0..100 float where possible.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    if number > 100:
+        number = number / 100.0
+    return max(0.0, min(100.0, number))
 
 
 def update_dock_estimate(
     dock: dict | None, x: float, y: float, max_samples: int = DOCK_MAX_SAMPLES
 ) -> dict:
-    """Fold one docked pose sample into the running dock-position average.
-
-    Returns a new dict {"x", "y", "n"}; pass the previous result (or None)
-    as ``dock``. The capped incremental mean smooths RTK jitter while still
-    converging on a new location if the dock is moved.
-    """
+    """Fold one docked pose sample into the running dock-position average."""
     d = dock or {"x": 0.0, "y": 0.0, "n": 0}
     n = min(int(d.get("n", 0)), max_samples - 1)
     return {
-        "x": (d["x"] * n + float(x)) / (n + 1),
-        "y": (d["y"] * n + float(y)) / (n + 1),
+        "x": (float(d["x"]) * n + float(x)) / (n + 1),
+        "y": (float(d["y"]) * n + float(y)) / (n + 1),
         "n": n + 1,
     }
 
@@ -75,19 +85,14 @@ def update_dock_estimate(
 def parse_location_payload(
     cache: dict[str, dict], device_id: str, data: Any
 ) -> dict | None:
-    """Merge one location message into the per-device cache.
-
-    Zone handling is intentionally kept compatible with the original fork:
-    - type 3 / partitionIds is the target/requested zone list.
-    - type 2 / currentMowBoundary is the physically active mowing zone.
-
-    Extra fields discovered from MQTT are kept, but they do not overwrite the
-    original partitionIds-based target-zone fields.
-    """
+    """Merge one location message into the per-device cache."""
     if not isinstance(data, list):
         return None
     loc = dict(cache.get(device_id) or {})
     loc["device_id"] = device_id
+    # Per-payload marker. It must be reset on every MQTT message so
+    # progress/zone packets do not look like fresh pose updates.
+    loc["_pose_updated"] = False
     changed = False
 
     for item in data:
@@ -96,12 +101,14 @@ def parse_location_payload(
         t = item.get("type")
 
         if t == 1:
-            try:
-                loc["x"] = float(item["postureX"])
-                loc["y"] = float(item["postureY"])
-                loc["theta"] = float(item["postureTheta"])
-            except (TypeError, ValueError, KeyError):
-                pass
+            xy = valid_xy(item.get("postureX"), item.get("postureY"))
+            if xy is not None:
+                loc["x"], loc["y"] = xy
+                loc["_pose_updated"] = True
+                try:
+                    loc["theta"] = float(item["postureTheta"])
+                except (TypeError, ValueError, KeyError):
+                    pass
             if "vehicleState" in item:
                 loc["vehicle_state"] = item["vehicleState"]
             if "time" in item:
@@ -109,16 +116,18 @@ def parse_location_payload(
             changed = True
 
         elif t == 2:
-            # Live physical-mowing progress. currentMowBoundary is the
-            # partition the mower is actually mowing now. Keep it separate from
-            # the target-zone fields so the original zone logic is not lost.
             if "currentMowBoundary" in item:
                 loc["mow_boundary"] = item.get("currentMowBoundary")
                 loc["mow_boundary_time"] = item.get("time")
             if "currentMowProgress" in item:
                 loc["mow_progress"] = item.get("currentMowProgress")
+                loc["mow_progress_percent"] = normalize_progress(
+                    item.get("currentMowProgress")
+                )
             if "mowingPercentage" in item:
-                loc["mowing_percentage"] = item.get("mowingPercentage")
+                loc["mowing_percentage"] = normalize_progress(
+                    item.get("mowingPercentage")
+                )
             if "subtotalArea" in item:
                 try:
                     loc["subtotal_area"] = float(item.get("subtotalArea"))
@@ -142,9 +151,6 @@ def parse_location_payload(
             changed = True
 
         elif t == 3:
-            # Original fork behaviour: partitionIds is the target zone list.
-            # Some packets contain only {"type": 3, "time": ...}; those are
-            # heartbeat/refresh packets and must not clear a previously known zone.
             if "partitionIds" in item:
                 pids = item.get("partitionIds")
                 loc["partition_ids"] = pids
@@ -157,8 +163,6 @@ def parse_location_payload(
 
         elif t == 4:
             if "taskDelay" in item:
-                # Observed behaviour: taskDelay is true when an active task exists
-                # and false after Cancel Task. Keep raw value too for debugging.
                 loc["active_task"] = item.get("taskDelay")
                 loc["task_delay"] = item.get("taskDelay")
             if "vehicleState" in item:
